@@ -1,0 +1,14 @@
+{
+  "machine": "laptop",
+  "hub_url": "http://127.0.0.1:37460",
+  "token_file": "token",
+  "tunnel": [
+    "ssh", "-N",
+    "-o", "BatchMode=yes",
+    "-o", "ExitOnForwardFailure=yes",
+    "-o", "ServerAliveInterval=30",
+    "-o", "ServerAliveCountMax=3",
+    "-L", "127.0.0.1:37460:127.0.0.1:37460",
+    "user@hub.example.com"
+  ]
+}

@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local runtime and deployment configuration
+.agentbus/
+config.json
+token
+*.token
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.sock
+*.pid
+*.lock
+
+# Private key files
+*.pem
+*.key
+id_rsa*
+id_ed25519*

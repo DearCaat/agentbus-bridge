@@ -1,0 +1,12 @@
+{
+  "name": "agentbus-plugins",
+  "description": "Self-hosted messaging between live agent sessions.",
+  "owner": {"name": "Wenhao Tang"},
+  "plugins": [
+    {
+      "name": "agentbus",
+      "source": "./",
+      "description": "Self-hosted messaging between live Claude Code and Codex sessions."
+    }
+  ]
+}

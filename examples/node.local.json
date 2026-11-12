@@ -1,0 +1,6 @@
+{
+  "machine": "laptop",
+  "hub_url": "http://127.0.0.1:37460",
+  "token_file": "token",
+  "tunnel": null
+}
