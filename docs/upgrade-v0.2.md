@@ -12,14 +12,15 @@ message. It adds ordered directional streams and durable queryable history.
 2. Record the old version/command and retain its code. Use SQLite's backup API
    for a consistent copy of a live DB, including its WAL transactions; copying
    only the main `.db` file is not a valid live backup.
-3. Check out `v0.2.0` in a separate directory. Verify it with a temporary database
+3. Check out `v0.2.1` in a separate directory. Verify it with a temporary database
    and token on a separate local port, then stop that temporary process. Do not
    use live sessions as a smoke-test destination.
 4. Stop only the old hub through its existing supervisor and start the new code
-   with the **same** DB/token/loopback port. The new code adds independent v2
+   with the **same** DB/token/loopback port. Set `--log-file` to a private service
+   log path to enable built-in bounded access-log rotation. The new code adds independent v2
    tables; legacy v1 tables and messages are preserved. Optional retention flags
    are documented in README. No external broker or new public listener is needed.
-5. Verify `/v1/health` returns `version: "0.2.0"` and `protocols: [1, 2]` before
+5. Verify `/v1/health` returns `version: "0.2.1"` and `protocols: [1, 2]` before
    activating new clients. Inspect correlated JSON access logs and DB permissions.
 
 A live backup can be made on the hub using this example (replace paths):
@@ -41,7 +42,7 @@ backup location/permissions must preserve the existing private deployment policy
 ## Update clients
 
 Update each installation's existing marketplace entry to this public repository
-at `v0.2.0`, preserving its installed identity and private configuration. Existing
+at `v0.2.1`, preserving its installed identity and private configuration. Existing
 processes keep their loaded code. Reload the plugin or start a new session when
 ready; its node ensure mechanism adopts the new package version. A new client
 refuses reliable operations if the hub is not protocol 2, with an explicit error.

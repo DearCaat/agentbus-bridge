@@ -117,7 +117,7 @@ class TestAuthAndHealth(HubTestCase):
     def test_health_needs_no_auth(self):
         status, out = self.get("/v1/health", token=None)
         self.assertEqual(status, 200)
-        self.assertEqual(out, {"ok": True, "version": "0.2.0", "protocols": [1, 2]})
+        self.assertEqual(out, {"ok": True, "version": "0.2.1", "protocols": [1, 2]})
 
     def test_missing_or_wrong_token_is_401(self):
         self.assertError(self.get("/v1/peers", token=None), 401, "unauthorized")

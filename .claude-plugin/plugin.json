@@ -1,6 +1,6 @@
 {
   "name": "agentbus",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Self-hosted cross-harness, cross-machine messaging between live Claude Code and Codex sessions.",
   "author": {
     "name": "Wenhao Tang"

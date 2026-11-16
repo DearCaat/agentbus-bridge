@@ -73,7 +73,8 @@ with os.fdopen(fd, "w") as f:
 PY
 python3 -m agentbus hub \
   --db "$HOME/.agentbus-hub/hub.db" \
-  --token-file "$HOME/.agentbus-hub/token"
+  --token-file "$HOME/.agentbus-hub/token" \
+  --log-file "$HOME/.agentbus-hub/hub.log"
 ```
 
 The hub listens on `127.0.0.1:37460`. Keep it running in your preferred process
@@ -242,6 +243,16 @@ sequence, attempt, reason and time in the **same transaction**. HTTP access logs
 include request/message correlation IDs and omit body/authentication data.
 Status and history remain queryable after reconnecting; log arrival time is not
 message delivery order.
+
+Use `--log-file /private/path/hub.log` to enable built-in rotation for Hub JSON
+access and operational logs. The default is 5 MiB per file with three archives
+(`hub.log.1` through `.3`); override with positive integers `--log-max-bytes` and
+`--log-backup-count`. Current logs and retained archives have mode `600`, including
+existing files. An existing oversized log is preserved as the first archive on
+the next write, then ages out through normal rotation; individual records remain
+whole. Without `--log-file`, output stays on stderr and this built-in rotation
+does not manage shell-redirected logs. File logging writes synchronously and
+flushes each record; storage errors are reported on stderr.
 
 The running hub checks cleanup every 30 seconds, including when idle:
 

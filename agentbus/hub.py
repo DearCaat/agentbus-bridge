@@ -7,7 +7,9 @@ import argparse
 import hashlib
 import hmac
 import json
+import logging
 import math
+import os
 import re
 import sqlite3
 import sys
@@ -16,6 +18,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
@@ -33,6 +36,78 @@ HARNESSES = ("claude", "codex")
 REPORT_STATES = ("delivered", "failed", "held", "in_doubt")
 TERMINAL_STATES = ("delivered", "failed", "held", "in_doubt", "expired")
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+
+
+def _positive_int(value):
+    if isinstance(value, str):
+        try:
+            value = int(value)
+        except ValueError:
+            raise ValueError("must be a positive integer")
+    if type(value) is not int or value <= 0:
+        raise ValueError("must be a positive integer")
+    return value
+
+
+class _PrivateRotatingHandler(RotatingFileHandler):
+    def _open(self):
+        # os.open's creation mode also protects the interval before chmod. An
+        # inherited existing log may have been created by shell redirection as 644.
+        fd = os.open(self.baseFilename, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            return os.fdopen(fd, self.mode, encoding=self.encoding, errors=self.errors)
+        except BaseException:
+            os.close(fd)
+            raise
+
+
+class HubLog:
+    """Synchronous complete-record logging; rotation is covered by the same lock.
+
+    No queue or stdout/stderr replacement: every write is flushed before return.
+    Close shares the write lock, so an in-progress record finishes before close.
+    """
+    def __init__(self, path=None, max_bytes=LOG_MAX_BYTES, backup_count=LOG_BACKUP_COUNT):
+        max_bytes = _positive_int(max_bytes)
+        backup_count = _positive_int(backup_count)
+        self._lock = threading.RLock()
+        self.closed = False
+        self.handler = None
+        if path is not None:
+            path = os.path.abspath(os.fspath(path))
+            for index in range(1, backup_count + 1):
+                try:
+                    os.chmod(path + ".%d" % index, 0o600)
+                except FileNotFoundError:
+                    pass
+            self.handler = _PrivateRotatingHandler(path, maxBytes=max_bytes,
+                                                  backupCount=backup_count, encoding="utf-8")
+            self.handler.setFormatter(logging.Formatter("%(message)s"))
+
+    def write(self, record):
+        message = json.dumps(record, separators=(",", ":"))
+        with self._lock:
+            if self.closed:
+                # Late daemon-worker diagnostics after server_close must neither
+                # reopen a file handler nor write to a closed descriptor.
+                return
+            if self.handler is None:
+                sys.stderr.write(message + "\n")
+                sys.stderr.flush()
+            else:
+                entry = logging.LogRecord("agentbus.hub", logging.INFO, "", 0, message, (), None)
+                self.handler.handle(entry)
+
+    def close(self):
+        with self._lock:
+            if not self.closed:
+                if self.handler is not None:
+                    self.handler.flush()
+                    self.handler.close()
+                self.closed = True
 
 _MACHINE_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 _NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
@@ -701,11 +776,18 @@ class HubServer(ThreadingHTTPServer):
     allow_reuse_address = True
     request_queue_size = 128
 
-    def __init__(self, addr, hub, token):
+    def __init__(self, addr, hub, token, log=None):
         self.hub = hub
+        self.log = log if log is not None else HubLog()
         self.token_bytes = token.encode("utf-8")
         self._next_gc = 0
         ThreadingHTTPServer.__init__(self, addr, Handler)
+
+    def server_close(self):
+        try:
+            super().server_close()
+        finally:
+            self.log.close()
 
     def service_actions(self):
         # Runs in the HTTP serve loop even with no requests; workers never run GC
@@ -716,7 +798,7 @@ class HubServer(ThreadingHTTPServer):
             try:
                 self.hub.sweep2()
             except Exception as exc:
-                sys.stderr.write(json.dumps(dict(event="gc_error", error=type(exc).__name__)) + "\n")
+                self.log.write(dict(event="gc_error", error=type(exc).__name__))
 
 
 _ROUTES = {
@@ -760,8 +842,7 @@ class Handler(BaseHTTPRequestHandler):
                       msg_id=getattr(self, "_msg_id", None),
                       client_msg_id=getattr(self, "_client_msg_id", None),
                       elapsed_ms=round(elapsed_ms, 1))
-        sys.stderr.write(json.dumps(record, separators=(",", ":")) + "\n")
-        sys.stderr.flush()
+        self.server.log.write(record)
 
     def do_GET(self):
         self._dispatch("GET")
@@ -831,8 +912,8 @@ class Handler(BaseHTTPRequestHandler):
         except ApiError as e:
             self._send_json(e.status, {"error": e.code, "message": e.message})
         except Exception as exc:
-            sys.stderr.write(json.dumps(dict(event="request_error", request_id=self._request_id,
-                                            error=type(exc).__name__)) + "\n")
+            self.server.log.write(dict(event="request_error", request_id=self._request_id,
+                                       error=type(exc).__name__))
             self._send_json(500, {"error": "internal", "message": "internal error"})
 
     def _handle(self, method, path, query_string):
@@ -901,18 +982,23 @@ def _parse_wait(raw):
 
 def make_server(db_path, token, host="127.0.0.1", port=DEFAULT_PORT,
                 lease_seconds=LEASE_SECONDS, queue_ttl=QUEUE_TTL_SECONDS,
-                body_retention_days=7, event_retention_days=30):
+                body_retention_days=7, event_retention_days=30,
+                log_file=None, log_max_bytes=LOG_MAX_BYTES, log_backup_count=LOG_BACKUP_COUNT):
     """Build (but do not run) a hub server. server.hub is the Hub; port 0 = ephemeral."""
     if host not in LOOPBACK_HOSTS:
         raise ValueError("hub must bind a loopback address (127.0.0.1), not %r" % host)
     if not token:
         raise ValueError("token must be non-empty")
-    hub = Hub(db_path, lease_seconds=lease_seconds, queue_ttl=queue_ttl,
-              body_retention_days=body_retention_days, event_retention_days=event_retention_days)
+    log = HubLog(log_file, log_max_bytes, log_backup_count)
+    hub = None
     try:
-        return HubServer((host, port), hub, token)
+        hub = Hub(db_path, lease_seconds=lease_seconds, queue_ttl=queue_ttl,
+                  body_retention_days=body_retention_days, event_retention_days=event_retention_days)
+        return HubServer((host, port), hub, token, log)
     except BaseException:
-        hub.close()
+        if hub is not None:
+            hub.close()
+        log.close()
         raise
 
 
@@ -925,14 +1011,20 @@ def _read_token(token_file):
 
 
 def serve(db_path, token_file, host="127.0.0.1", port=DEFAULT_PORT,
-          body_retention_days=7, event_retention_days=30):
+          body_retention_days=7, event_retention_days=30,
+          log_file=None, log_max_bytes=LOG_MAX_BYTES, log_backup_count=LOG_BACKUP_COUNT):
     token = _read_token(token_file)
     server = make_server(db_path, token, host=host, port=port,
-                         body_retention_days=body_retention_days, event_retention_days=event_retention_days)
-    sys.stderr.write("agentbus hub %s listening on %s:%d db=%s\n"
-                     % (VERSION, host, server.server_address[1], db_path))
-    sys.stderr.flush()
+                         body_retention_days=body_retention_days, event_retention_days=event_retention_days,
+                         log_file=log_file, log_max_bytes=log_max_bytes, log_backup_count=log_backup_count)
     try:
+        if log_file is None:
+            sys.stderr.write("agentbus hub %s listening on %s:%d db=%s\n"
+                             % (VERSION, host, server.server_address[1], db_path))
+            sys.stderr.flush()
+        else:
+            server.log.write(dict(event="hub_start", version=VERSION, host=host,
+                                  port=server.server_address[1]))
         server.serve_forever()
     finally:
         server.server_close()
@@ -949,10 +1041,16 @@ def main(argv=None):
                         help="prune ACKed message bodies after this many days (default: 7)")
     parser.add_argument("--event-retention-days", type=_positive_days, default=30,
                         help="prune ACKed message history after this many days (default: 30)")
+    parser.add_argument("--log-file", help="private rotating JSON log; default: stderr without built-in rotation")
+    parser.add_argument("--log-max-bytes", type=_positive_int, default=LOG_MAX_BYTES,
+                        help="positive log rotation size in bytes (default: 5242880)")
+    parser.add_argument("--log-backup-count", type=_positive_int, default=LOG_BACKUP_COUNT,
+                        help="positive number of retained log archives (default: 3)")
     args = parser.parse_args(argv)
     try:
         serve(args.db, args.token_file, host=args.host, port=args.port,
-              body_retention_days=args.body_retention_days, event_retention_days=args.event_retention_days)
+              body_retention_days=args.body_retention_days, event_retention_days=args.event_retention_days,
+              log_file=args.log_file, log_max_bytes=args.log_max_bytes, log_backup_count=args.log_backup_count)
     except KeyboardInterrupt:
         return 0
     except (OSError, ValueError, sqlite3.Error) as e:
