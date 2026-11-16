@@ -13,6 +13,21 @@ session ──MCP──> node (one per machine) ──SSH tunnel──> hub (SQL
 The hub can run on any suitable Linux host. No hosted service, GPU, or Python
 third-party package is required. Protocol details: [SPEC.md](SPEC.md).
 
+## Reliability protocol 2 (v0.2.0)
+
+Upgrade the hub to v0.2.0 **before** enabling these clients. Verify that
+`GET /v1/health` reports `protocols: [1, 2]`. A new client refuses reliable
+operations on an old hub; it never silently sends through the old protocol.
+See [the upgrade procedure](docs/upgrade-v0.2.md).
+
+Like Matrix transaction IDs and reply relations, each send has a stable caller
+request ID and each reply names its parent message. Like publisher confirms and
+consumer acknowledgements in message brokers, hub acceptance and recipient ACK
+are separate facts. Native injection does not prove understanding or task
+completion. Design sources: [Matrix client/server specification](https://spec.matrix.org/latest/client-server-api/#transaction-identifiers),
+[Matrix replies](https://spec.matrix.org/latest/client-server-api/#rich-replies),
+[RabbitMQ confirmations](https://www.rabbitmq.com/docs/confirms).
+
 ## Compatibility
 
 - Python 3.10+, Linux or WSL, and OpenSSH for cross-machine connections.
@@ -143,28 +158,112 @@ may wait until the first turn or tool call exposes its thread ID.
 
 | Tool | Purpose |
 | --- | --- |
-| `agentbus_whoami()` | Own address, session key, and local node status |
-| `agentbus_peers()` | Registered sessions and online status |
-| `agentbus_send(to, text)` | Send to an exact address or session key |
-| `agentbus_status(msg_id)` | Delivery state |
-| `agentbus_rename(name)` | Change the local session's friendly name |
+| `agentbus_whoami()` | Own address, session key and local node status |
+| `agentbus_peers()` | Registered peers and online status |
+| `agentbus_send(to, text, request_id, reply_to?)` | Persist one logical send; exact parent for replies |
+| `agentbus_status(msg_id=... OR request_id=...)` | Observe status; provide exactly one identifier |
+| `agentbus_message(msg_id)` | Retrieve retained full content or an explicit blocked/pruned result |
+| `agentbus_inbox(after=0, limit=50)` | Page received messages; later blocked content is withheld |
+| `agentbus_history(msg_id, after=0, limit=50)` | Page durable events with explicit pruning flags |
+| `agentbus_ack(msg_id)` | Explicitly declare receipt after reading this message |
+| `agentbus_rename(name)` | Set a friendly session name |
 
-An address is `<machine>/<harness>/<name>`; the default name is the first eight
-characters of the session ID. Discover a peer, send a short message, and check
-its status. Unknown targets fail with `unknown_target`; same-machine,
-same-harness targets fail with `same_machine_same_harness`.
+An address is `<machine>/<harness>/<name>`. Targets are exact; unknown targets
+fail, and same-machine same-harness targets use the harness's own messaging.
 
-`delivered` means the input route accepted the message: a Claude socket write
-succeeded or `codex queue` exited successfully. It does **not** confirm that the
-model read or acted on it. A live session can be awakened or receive input while
-busy, depending on its harness. Offline messages remain queued; a node crash
-mid-injection can produce `in_doubt` rather than silently retrying an ambiguous
-injection.
+For each logical send, choose a unique `request_id` **before sending** and retain
+it. An agent tool call looks like this (substitute an exact discovered target):
 
-To diagnose setup, run `python3 -m agentbus peers` from the checkout and inspect
-`node.log` under `AGENTBUS_HOME`. `agentbus_whoami` reports registration problems.
-If `codex queue` is unavailable or Claude exposes no messaging socket, the
-corresponding receiving adapter cannot work in that installation.
+```json
+{"to":"server/claude/reviewer","text":"Review revision abc123.","request_id":"review-abc123-1"}
+```
+
+After a timeout, retry with the **same** request ID, target, text and reply parent,
+or query `agentbus_status(request_id="review-abc123-1")`. Reusing an ID with a
+changed payload is rejected. A new ID means a new message, not a retry.
+
+The sender node commits an outbox entry before sending over the network and
+serializes acceptance in each directional stream. The hub durably stores a
+message, assigns its stable `msg_id`, and returns its stream `seq`, exact peers,
+`reply_to`, `blocked_by`, state revision and explicit receipt status.
+`submission="accepted"` means **stored by the hub**, not received by the agent.
+A locally persisted but unconfirmed send says `pending`; connectivity failure
+must not be interpreted as definite non-delivery.
+
+On receiving a full message, read it and explicitly call `agentbus_ack(msg_id)`.
+Fetching content does not automatically ACK. Reply using a new stable request ID
+and `reply_to` equal to the received `msg_id`; the parent must belong to the same
+pair of peers in the opposite direction. Replies carry their exact association,
+not a guess based on arrival time. Task/review completion must be stated and
+bound to the relevant task/revision by the participating agents.
+
+### Order and uncertainty
+
+Order is per `(sending session, receiving session)`, using persisted sequence
+numbers, not wall-clock timestamps. Concurrent independent streams have no
+promised global order. A later message stays blocked until the preceding message
+has an explicit recipient ACK; this also applies to `message` and `inbox`, which
+withhold later text. Other directional streams continue independently.
+
+| State | Evidence |
+| --- | --- |
+| `pending` (local) | Stored by sender; hub acceptance unconfirmed |
+| `queued` | Hub accepted; awaiting recipient-side delivery |
+| `leased` | A node claimed an attempt; receipt unconfirmed |
+| `injected` | Native input route accepted; agent has not acknowledged |
+| `acknowledged` | Recipient agent explicitly declared receipt; task completion unknown |
+| `failed` / `expired` | Attempt failed or queue expired; the stream remains blocked |
+| `in_doubt` | Injection may have occurred; do not blindly resend |
+| `unknown_or_pruned` | No retained record; cannot conclude never sent or not received |
+
+A missing ACK, failed injection or expired head is a visible block, not permission
+to skip it. A recipient can query its inbox, retrieve the head's retained content,
+and acknowledge it explicitly. An ACK is a recipient declaration, not proof of
+understanding. Socket/CLI timeouts and a crash during injection remain uncertain;
+existing node dedup records prevent blind reinjection. Delayed reports from an
+old lease cannot overwrite a newer attempt or recipient ACK.
+
+Every delivered envelope includes ID, sender/recipient, sequence, reply parent,
+ordering scope and exact ACK instructions, followed by the entire message text.
+UTF-8 byte length and SHA-256 are verified before native injection. Pagination
+uses explicit cursors and `has_more`; inspect `content_visible`, `body_retained`
+and `history_pruned` rather than interpreting missing content as an empty reply.
+Cached sender status is labeled stale and its current ACK field is unknown.
+
+Legacy `/v1` traffic stays isolated for migration and retains its old weaker
+semantics (`delivered` only meant native input submission). Old live MCP processes
+keep that interface until reloaded; installing new files alone does not upgrade
+an already-running session.
+
+### Durable history and cleanup
+
+Hub SQLite records each protocol-2 state transition and its event ID, message ID,
+sequence, attempt, reason and time in the **same transaction**. HTTP access logs
+include request/message correlation IDs and omit body/authentication data.
+Status and history remain queryable after reconnecting; log arrival time is not
+message delivery order.
+
+The running hub checks cleanup every 30 seconds, including when idle:
+
+- ACKed message bodies: retained for 7 days by default.
+- ACKed event history: retained for 30 days by default.
+- Override with `--body-retention-days` and `--event-retention-days` (positive days).
+- Active, uncertain, failed and unacknowledged heads are not pruned by this job.
+- Minimal IDs, fingerprints, stream counters and state tombstones remain for
+  deduplication and honest status lookup; these small indexes continue to grow.
+- Pruned bodies/history are explicitly marked. Cleanup never manufactures an ACK,
+  skips a head, or resets a sequence number. Legacy data is preserved unchanged.
+
+Node operational logs rotate at 5 MiB with three retained archives. Accepted
+outbox text is cleared only after its recipient ACK and authoritative Hub body
+pruning have been confirmed, at least 7 days after local creation; its identity,
+fingerprint, sequence and receipt remain. Unconfirmed outbox text is kept. Hub body/event cleanup is logical
+SQLite deletion: freed pages are reused; it is not a promise to shrink the DB
+file or securely erase disk backups. Protect database backups as private data.
+
+To diagnose, use status/history with an exact ID. For local setup issues inspect
+`node.log` under `AGENTBUS_HOME`. Do not repeatedly send with new IDs as a health
+check or infer task completion from a transport receipt.
 
 ## Trust and stored data
 

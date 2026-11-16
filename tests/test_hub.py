@@ -117,7 +117,7 @@ class TestAuthAndHealth(HubTestCase):
     def test_health_needs_no_auth(self):
         status, out = self.get("/v1/health", token=None)
         self.assertEqual(status, 200)
-        self.assertEqual(out, {"ok": True, "version": "0.1.0"})
+        self.assertEqual(out, {"ok": True, "version": "0.2.0", "protocols": [1, 2]})
 
     def test_missing_or_wrong_token_is_401(self):
         self.assertError(self.get("/v1/peers", token=None), 401, "unauthorized")
@@ -150,8 +150,8 @@ class TestAuthAndHealth(HubTestCase):
         # the request-log lines are the only stderr output
         lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
         self.assertEqual(len(lines), 2, lines)
-        self.assertIn("POST /v1/register 200", lines[0])
-        self.assertIn("GET /v1/peers 200", lines[1])
+        self.assertEqual((json.loads(lines[0])["method"], json.loads(lines[0])["path"], json.loads(lines[0])["status"]), ("POST", "/v1/register", 200))
+        self.assertEqual((json.loads(lines[1])["method"], json.loads(lines[1])["path"], json.loads(lines[1])["status"]), ("GET", "/v1/peers", 200))
         self.assertNotIn(TOKEN, buf.getvalue())
         self.assertNotIn("secretsess1", buf.getvalue())
 

@@ -391,6 +391,8 @@ class Node:
         self._srv = None
         self._logf = None
         self._log_lock = threading.Lock()
+        self._reliable = None
+        self._reliable_lock = threading.Lock()
 
     # ----- lifecycle -------------------------------------------------------
 
@@ -511,6 +513,25 @@ class Node:
         with self._log_lock:
             if self._logf is None:
                 return
+            # Rotate only this node's own logs; retain 3 archives, max 5 MiB each.
+            # Truncate the same inode so SSH/subprocess inherited append FDs stay valid.
+            try:
+                if os.path.getsize(self.p.log) >= 5 * 1024 * 1024:
+                    self._logf.flush()
+                    for number in (2, 1):
+                        old = self.p.log + '.' + str(number)
+                        if os.path.isfile(old):
+                            os.replace(old, self.p.log + '.' + str(number + 1))
+                    with open(self.p.log, 'rb') as source:
+                        source.seek(max(0, os.path.getsize(self.p.log) - 5 * 1024 * 1024))
+                        data = source.read(5 * 1024 * 1024)
+                    with open(self.p.log + '.1', 'wb') as archive:
+                        archive.write(data)
+                    os.chmod(self.p.log + '.1', 0o600)
+                    with open(self.p.log, 'r+b') as current:
+                        current.truncate(0)
+            except OSError:
+                pass
             self._logf.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), msg))
 
     # ----- local API (unix socket) -----------------------------------------
@@ -548,9 +569,18 @@ class Node:
         finally:
             conn.close()
 
+    def reliable(self):
+        with self._reliable_lock:
+            if self._reliable is None:
+                from .reliable import Reliable
+                self._reliable = Reliable(self)
+            return self._reliable
+
     def dispatch(self, req, peer_pid=0):
         if not isinstance(req, dict):
             return _fail("bad_request", "request must be a JSON object")
+        if req.get('op') in ('send2', 'status2', 'ack2', 'message2', 'inbox2', 'history2'):
+            return self.reliable().dispatch(req, peer_pid)
         handlers = {
             "register": self._op_register,
             "send": self._op_send,
@@ -728,6 +758,11 @@ class Node:
             except HubError as e:
                 self._log("heartbeat failed: %s" % e)
             self.flush_reports()
+            if self._reliable is not None:
+                try:
+                    self._reliable.maintenance()
+                except Exception as exc:
+                    self._log("v2 maintenance interrupted: %s" % type(exc).__name__)
             self._stop.wait(self.heartbeat_interval)
 
     def _send_report(self, msg_id, state, detail):
@@ -766,7 +801,23 @@ class Node:
         delay = 1.0
         while not self._stop.is_set():
             try:
-                msgs = self.hub.pull(self.machine, self.poll_wait)
+                reliable = self.reliable()
+                if reliable.available():
+                    reliable.flush()
+                    incoming = self.hub.pull2(self.machine, min(self.poll_wait, 1.0))
+                    for message in incoming.get('messages', []):
+                        if self._stop.is_set():
+                            break
+                        try:
+                            reliable.handle(message)
+                        except Exception as exc:
+                            self._log("v2 handling interrupted: %s" % type(exc).__name__)
+                    # Legacy sessions keep working during a rolling upgrade.
+                    msgs = self.hub.pull(self.machine, 0)
+                    if not incoming.get('messages') and not msgs.get('messages'):
+                        self._stop.wait(0.1)
+                else:
+                    msgs = self.hub.pull(self.machine, self.poll_wait)
             except HubError as e:
                 self._log("pull failed: %s; retry in %.0fs" % (e, delay))
                 self._stop.wait(delay)
@@ -816,7 +867,7 @@ class Node:
                 return "failed", "target session not live (mcp_pid %s)" % sess["mcp_pid"]
             from_address = m.get("from_address") or ""
             local = same_machine_harness(from_address, self.machine, sess["harness"])
-            rendered = render(m["msg_id"], from_address, text, local_harness=sess["harness"] if local else None)
+            rendered = render(m["msg_id"], from_address, text, local_harness=sess["harness"] if local else None, metadata=m if "seq" in m else None)
             d = sess["deliver"]
             if sess["harness"] == "claude":
                 if not d.get("socket"):

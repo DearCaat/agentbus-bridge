@@ -48,12 +48,12 @@ def default_node_handler(req):
              "harness": "claude", "name": "bob", "cwd": "/w/b", "online": False,
              "last_seen": "2026-11-09T10:00:00Z"},
         ]}
-    if op == "send":
+    if op == "send2":
         if req.get("to") == "nobody/x/y":
             return {"ok": False, "error": "unknown_target", "detail": "no such address"}
-        return {"ok": True, "msg_id": "msg-0001", "target": req.get("to"), "target_online": True}
-    if op == "status":
-        return {"ok": True, "msg_id": req.get("msg_id"), "state": "delivered", "detail": None,
+        return {"ok": True, "msg_id": "msg-0001", "target": req.get("to"), "target_online": True, "submission": "accepted", "receiver_acknowledged": False}
+    if op == "status2":
+        return {"ok": True, "msg_id": req.get("msg_id"), "state": "injected", "detail": None,
                 "target": "testbox/codex/22222222"}
     return {"ok": False, "error": "unknown_op"}
 
@@ -208,19 +208,20 @@ class TestProtocol(McpTestBase):
                                     "clientInfo": {"name": "t", "version": "0"}})
         res = msg["result"]
         self.assertEqual(res["protocolVersion"], "2025-06-18")
-        self.assertEqual(res["serverInfo"], {"name": "agentbus", "version": "0.1.0"})
+        self.assertEqual(res["serverInfo"], {"name": "agentbus", "version": "0.2.0"})
         self.assertIn("tools", res["capabilities"])
 
-    def test_tools_list_has_five_tools_with_schemas(self):
+    def test_tools_list_has_nine_tools_with_schemas(self):
         self.start_node()
         m = self.start_mcp(extra_env={"CLAUDE_CODE_SESSION_ID": CLAUDE_SID})
         tools = {t["name"]: t for t in m.rpc("tools/list")["result"]["tools"]}
-        self.assertEqual(sorted(tools), ["agentbus_peers", "agentbus_rename", "agentbus_send",
+        self.assertEqual(sorted(tools), ["agentbus_ack", "agentbus_history", "agentbus_inbox", "agentbus_message",
+                                         "agentbus_peers", "agentbus_rename", "agentbus_send",
                                          "agentbus_status", "agentbus_whoami"])
         for t in tools.values():
             self.assertEqual(t["inputSchema"]["type"], "object")
             self.assertTrue(t["description"])
-        self.assertEqual(tools["agentbus_send"]["inputSchema"]["required"], ["to", "text"])
+        self.assertEqual(tools["agentbus_send"]["inputSchema"]["required"], ["to", "text", "request_id"])
         for name in ("agentbus_send", "agentbus_peers"):
             self.assertIn("SendMessage", tools[name]["description"])  # same-harness pointer to the harness
 
@@ -280,53 +281,51 @@ class TestClaudeFlow(McpTestBase):
         self.assertIn("address", text.splitlines()[0])
         self.assertIn("no", [c for c in text.splitlines()[2].split()])
 
-        err, text = m.tool("agentbus_send", {"to": "testbox/codex/22222222", "text": "hi there"})
+        err, text = m.tool("agentbus_send", {"request_id": "test-request-1", "to": "testbox/codex/22222222", "text": "hi there"})
         self.assertFalse(err)
         sent = json.loads(text)
         self.assertEqual(sent["msg_id"], "msg-0001")
         self.assertTrue(sent["target_online"])
-        s = self.node.ops("send")[0]
+        s = self.node.ops("send2")[0]
         self.assertEqual(s["session_key"], "testbox:claude:" + CLAUDE_SID)
         self.assertEqual(s["to"], "testbox/codex/22222222")
         self.assertEqual(s["text"], "hi there")
-        uuid_text = s["client_msg_id"]
-        self.assertEqual(len(uuid_text), 36)
-        self.assertEqual(uuid_text.count("-"), 4)
+        self.assertEqual(s["client_msg_id"], "test-request-1")
 
         err, text = m.tool("agentbus_status", {"msg_id": "msg-0001"})
         self.assertFalse(err)
         st = json.loads(text)
-        self.assertEqual(st["state"], "delivered")
+        self.assertEqual(st["state"], "injected")
         self.assertEqual(st["msg_id"], "msg-0001")
 
     def test_same_machine_same_harness_send_is_refused_without_calling_node_send(self):
         self.start_node()
         m = self.start_mcp(extra_env=self.claude_env())
-        err, text = m.tool("agentbus_send", {"to": "testbox/claude/bob", "text": "hi"})
+        err, text = m.tool("agentbus_send", {"request_id": "test-request-1", "to": "testbox/claude/bob", "text": "hi"})
         self.assertTrue(err)
         self.assertIn("same_machine_same_harness", text)
         self.assertIn("SendMessage", text)
-        self.assertEqual(self.node.ops("send"), [])
+        self.assertEqual(self.node.ops("send2"), [])
 
     def test_send_by_session_key_is_refused_only_when_peer_list_says_same_machine_harness(self):
         self.start_node()
         m = self.start_mcp(extra_env=self.claude_env())
-        err, text = m.tool("agentbus_send", {"to": "k2", "text": "hi"})  # peer k2: testbox/claude
+        err, text = m.tool("agentbus_send", {"request_id": "test-request-1", "to": "k2", "text": "hi"})  # peer k2: testbox/claude
         self.assertTrue(err)
         self.assertIn("same_machine_same_harness", text)
-        err, text = m.tool("agentbus_send", {"to": "k1", "text": "hi"})  # peer k1: testbox/codex
+        err, text = m.tool("agentbus_send", {"request_id": "test-request-1", "to": "k1", "text": "hi"})  # peer k1: testbox/codex
         self.assertFalse(err)
-        err, text = m.tool("agentbus_send", {"to": "not-in-peers", "text": "hi"})  # undetermined: sent as usual
+        err, text = m.tool("agentbus_send", {"request_id": "test-request-1", "to": "not-in-peers", "text": "hi"})  # undetermined: sent as usual
         self.assertFalse(err)
-        self.assertEqual([s["to"] for s in self.node.ops("send")], ["k1", "not-in-peers"])
+        self.assertEqual([s["to"] for s in self.node.ops("send2")], ["k1", "not-in-peers"])
 
     def test_other_machine_same_harness_and_same_machine_other_harness_are_sent(self):
         self.start_node()
         m = self.start_mcp(extra_env=self.claude_env())
         for to in ("wsl/claude/bob", "testbox/codex/22222222"):
-            err, text = m.tool("agentbus_send", {"to": to, "text": "hi"})
+            err, text = m.tool("agentbus_send", {"request_id": "test-request-1", "to": to, "text": "hi"})
             self.assertFalse(err, to)
-        self.assertEqual([s["to"] for s in self.node.ops("send")], ["wsl/claude/bob", "testbox/codex/22222222"])
+        self.assertEqual([s["to"] for s in self.node.ops("send2")], ["wsl/claude/bob", "testbox/codex/22222222"])
 
     def test_rename_sends_register_with_name_and_updates_address(self):
         self.start_node()
@@ -389,22 +388,22 @@ class TestCodexFlow(McpTestBase):
     def test_send_before_any_thread_id_reports_not_registered(self):
         self.start_node()
         m = self.start_mcp(extra_env=self.codex_env())
-        err, text = m.tool("agentbus_send", {"to": "testbox/claude/bob", "text": "x"})
+        err, text = m.tool("agentbus_send", {"request_id": "test-request-1", "to": "testbox/claude/bob", "text": "x"})
         self.assertTrue(err)
         self.assertIn("not_registered", text)
-        self.assertEqual(self.node.ops("send"), [])
+        self.assertEqual(self.node.ops("send2"), [])
 
     def test_codex_same_machine_same_harness_send_is_refused(self):
         self.start_node()
         m = self.start_mcp(extra_env=self.codex_env())
         meta = {"threadId": CODEX_TID}
-        err, text = m.tool("agentbus_send", {"to": "testbox/codex/22222222", "text": "x"}, meta=meta)
+        err, text = m.tool("agentbus_send", {"request_id": "test-request-1", "to": "testbox/codex/22222222", "text": "x"}, meta=meta)
         self.assertTrue(err)
         self.assertIn("same_machine_same_harness", text)
-        self.assertEqual(self.node.ops("send"), [])
-        err, text = m.tool("agentbus_send", {"to": "testbox/claude/bob", "text": "x"}, meta=meta)
+        self.assertEqual(self.node.ops("send2"), [])
+        err, text = m.tool("agentbus_send", {"request_id": "test-request-1", "to": "testbox/claude/bob", "text": "x"}, meta=meta)
         self.assertFalse(err)
-        self.assertEqual([s["to"] for s in self.node.ops("send")], ["testbox/claude/bob"])
+        self.assertEqual([s["to"] for s in self.node.ops("send2")], ["testbox/claude/bob"])
 
 
 class TestErrors(McpTestBase):
@@ -415,28 +414,28 @@ class TestErrors(McpTestBase):
     def test_node_error_becomes_tool_error(self):
         self.start_node()
         m = self.start_mcp(extra_env=self.env)
-        err, text = m.tool("agentbus_send", {"to": "nobody/x/y", "text": "hello"})
+        err, text = m.tool("agentbus_send", {"request_id": "test-request-1", "to": "nobody/x/y", "text": "hello"})
         self.assertTrue(err)
         self.assertIn("unknown_target", text)
 
     def test_send_missing_or_bad_arguments(self):
         self.start_node()
         m = self.start_mcp(extra_env=self.env)
-        err, text = m.tool("agentbus_send", {"to": "testbox/codex/22222222"})
+        err, text = m.tool("agentbus_send", {"request_id": "test-request-1", "to": "testbox/codex/22222222"})
         self.assertTrue(err)
         self.assertIn("invalid_arguments", text)
         err, text = m.tool("agentbus_status", {})
         self.assertTrue(err)
         self.assertIn("msg_id", text)
-        self.assertEqual(self.node.ops("send"), [])
+        self.assertEqual(self.node.ops("send2"), [])
 
     def test_text_over_64_kib_rejected_locally(self):
         self.start_node()
         m = self.start_mcp(extra_env=self.env)
-        err, text = m.tool("agentbus_send", {"to": "testbox/codex/22222222", "text": "x" * (64 * 1024 + 1)})
+        err, text = m.tool("agentbus_send", {"request_id": "test-request-1", "to": "testbox/codex/22222222", "text": "x" * (64 * 1024 + 1)})
         self.assertTrue(err)
         self.assertIn("too_large", text)
-        self.assertEqual(self.node.ops("send"), [])
+        self.assertEqual(self.node.ops("send2"), [])
 
     def test_rename_rejects_bad_name_without_calling_node(self):
         self.start_node()
@@ -460,7 +459,7 @@ class TestErrors(McpTestBase):
     def test_node_down_tools_return_errors_not_crash(self):
         m = self.start_mcp(extra_env=self.env)
         for name, args in [("agentbus_peers", {}), ("agentbus_status", {"msg_id": "m"}),
-                           ("agentbus_send", {"to": "a/b/c", "text": "t"})]:
+                           ("agentbus_send", {"request_id": "test-request-1", "to": "a/b/c", "text": "t"})]:
             err, text = m.tool(name, args)
             self.assertTrue(err, name)
             self.assertIn("node_unreachable", text, name)

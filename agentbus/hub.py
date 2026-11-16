@@ -4,6 +4,7 @@ Implements the "Hub HTTP API" section of SPEC.md.
 """
 
 import argparse
+import hashlib
 import hmac
 import json
 import math
@@ -12,13 +13,14 @@ import sqlite3
 import sys
 import threading
 import time
-import traceback
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-VERSION = "0.1.0"
+from . import __version__
+
+VERSION = __version__
 DEFAULT_PORT = 37460
 LEASE_SECONDS = 120.0
 QUEUE_TTL_SECONDS = 7 * 24 * 3600.0
@@ -68,6 +70,34 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_state ON messages (state, created_at);
 """
 
+SCHEMA_V2 = """
+CREATE TABLE IF NOT EXISTS streams_v2 (
+    from_key TEXT NOT NULL, to_key TEXT NOT NULL, last_enqueued INTEGER NOT NULL,
+    PRIMARY KEY (from_key, to_key)
+);
+CREATE TABLE IF NOT EXISTS messages_v2 (
+    message_order INTEGER PRIMARY KEY AUTOINCREMENT,
+    msg_id TEXT NOT NULL UNIQUE, from_key TEXT NOT NULL, to_key TEXT NOT NULL,
+    from_address TEXT NOT NULL, to_address TEXT NOT NULL,
+    client_msg_id TEXT NOT NULL, seq INTEGER NOT NULL, reply_to TEXT,
+    text TEXT, sha256 TEXT NOT NULL, text_bytes INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL, state TEXT NOT NULL, detail TEXT,
+    attempt INTEGER NOT NULL DEFAULT 0, lease_until REAL,
+    created_at REAL NOT NULL, updated_at REAL NOT NULL, acked_at REAL,
+    state_revision INTEGER NOT NULL DEFAULT 0,
+    history_pruned INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (from_key, client_msg_id), UNIQUE (from_key, to_key, seq)
+);
+CREATE INDEX IF NOT EXISTS messages_v2_head ON messages_v2(from_key,to_key,acked_at,seq);
+CREATE INDEX IF NOT EXISTS messages_v2_inbox ON messages_v2(to_key,message_order);
+CREATE TABLE IF NOT EXISTS events_v2 (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT, msg_id TEXT NOT NULL,
+    time REAL NOT NULL, seq INTEGER NOT NULL, attempt INTEGER NOT NULL,
+    state TEXT NOT NULL, reason TEXT NOT NULL, detail TEXT
+);
+CREATE INDEX IF NOT EXISTS events_v2_message ON events_v2(msg_id,event_id);
+"""
+
 
 class ApiError(Exception):
     def __init__(self, status, code, message):
@@ -106,20 +136,44 @@ def _opt_str(body, key, pattern=None, maxlen=512):
     return _req_str(body, key, pattern, maxlen)
 
 
+def _positive_days(value):
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("retention days must be finite and positive")
+    return value
+
+
+def _integer(value, name, minimum=0, maximum=2**63 - 1):
+    if isinstance(value, str):
+        if not value.isascii() or not value.isdigit():
+            raise _bad("%s must be an integer" % name)
+        try:
+            value = int(value)
+        except ValueError:
+            raise _bad("%s must be an integer" % name)
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise _bad("%s must be between %d and %d" % (name, minimum, maximum))
+    return value
+
+
 class Hub(object):
     """All state and business rules. Every DB access is serialized by self.lock."""
 
-    def __init__(self, db_path, lease_seconds=LEASE_SECONDS, queue_ttl=QUEUE_TTL_SECONDS):
+    def __init__(self, db_path, lease_seconds=LEASE_SECONDS, queue_ttl=QUEUE_TTL_SECONDS,
+                 body_retention_days=7, event_retention_days=30):
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
         self.lease_seconds = float(lease_seconds)
         self.queue_ttl = float(queue_ttl)
+        self.body_retention = _positive_days(body_retention_days) * 86400
+        self.event_retention = _positive_days(event_retention_days) * 86400
         self.conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False,
                                     isolation_level=None)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.executescript(SCHEMA)
+        self.conn.executescript(SCHEMA_V2)
 
     def close(self):
         with self.lock:
@@ -372,6 +426,276 @@ class Hub(object):
         }
 
 
+    # -- protocol 2: durable identity, causal streams, explicit receipt --------
+
+    def _row2(self, msg_id):
+        return self.conn.execute("SELECT * FROM messages_v2 WHERE msg_id=?", (msg_id,)).fetchone()
+
+    def _event2(self, msg_id, reason, now=None):
+        row = self._row2(msg_id)
+        now = time.time() if now is None else now
+        cur = self.conn.execute(
+            "INSERT INTO events_v2(msg_id,time,seq,attempt,state,reason,detail) VALUES(?,?,?,?,?,?,?)",
+            (msg_id, now, row["seq"], row["attempt"], row["state"], reason, row["detail"]))
+        self.conn.execute("UPDATE messages_v2 SET state_revision=?,updated_at=? WHERE msg_id=?",
+                          (cur.lastrowid, now, msg_id))
+
+    def _blocked2(self, row):
+        previous = self.conn.execute(
+            "SELECT msg_id FROM messages_v2 WHERE from_key=? AND to_key=? "
+            "AND seq<? AND acked_at IS NULL ORDER BY seq LIMIT 1",
+            (row["from_key"], row["to_key"], row["seq"])).fetchone()
+        return previous["msg_id"] if previous else None
+
+    def _snapshot2(self, row, full=False):
+        out = {k: row[k] for k in (
+            "msg_id", "client_msg_id", "from_key", "to_key", "from_address", "to_address",
+            "seq", "reply_to", "state", "attempt", "detail", "sha256", "text_bytes",
+            "message_order", "state_revision")}
+        out.update(submission="accepted", receiver_acknowledged=row["acked_at"] is not None,
+                   blocked_by=self._blocked2(row), body_retained=row["text"] is not None,
+                   history_pruned=bool(row["history_pruned"]), observed_at=_iso(time.time()),
+                   ordering_scope="sender_to_receiver", created_at=_iso(row["created_at"]),
+                   updated_at=_iso(row["updated_at"]), acknowledged_at=_iso(row["acked_at"]),
+                   summary=("Recipient explicitly acknowledged receipt; task completion is unknown."
+                            if row["acked_at"] is not None else
+                            "Accepted by hub; recipient receipt is not acknowledged."))
+        if full:
+            out["text"] = row["text"]
+        return out
+
+    def _participant2(self, msg_id, session_key):
+        row = self._row2(msg_id)
+        if row is not None and session_key not in (row["from_key"], row["to_key"]):
+            raise ApiError(403, "not_participant", "session is not a message participant")
+        return row
+
+    def _unknown2(self, msg_id):
+        return dict(msg_id=msg_id, state="unknown_or_pruned", submission="unknown",
+                    receiver_acknowledged=None, body_retained=False, text=None,
+                    client_msg_id=None, from_key=None, to_key=None, seq=None,
+                    blocked_by=None, attempt=None, state_revision=None,
+                    observed_at=_iso(time.time()), ordering_scope="sender_to_receiver",
+                    summary="No retained record; this does not establish whether a send occurred.")
+
+    def send2(self, body):
+        from_key = _req_str(body, "from_key")
+        to = _req_str(body, "to")
+        text = body.get("text")
+        if not isinstance(text, str) or not text:
+            raise _bad("text is required (non-empty string)")
+        try:
+            data = text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise _bad("text is not valid UTF-8")
+        if len(data) > MAX_TEXT_BYTES:
+            raise ApiError(413, "too_large", "text exceeds 64 KiB")
+        cid = _req_str(body, "client_msg_id", maxlen=200)
+        seq = _integer(body.get("client_seq"), "client_seq", 1)
+        reply = _opt_str(body, "reply_to", maxlen=128)
+        return self._write(self._send2_op, (from_key, to, text, cid, seq, reply, data), notify=True)
+
+    def _send2_op(self, from_key, to, text, cid, seq, reply, data):
+        sender, target = self._resolve(from_key), self._resolve(to)
+        if sender is None or sender["session_key"] != from_key:
+            raise ApiError(404, "unknown_sender", "sender is not registered")
+        if target is None:
+            raise ApiError(404, "unknown_target", "target is not registered")
+        to_key = target["session_key"]
+        digest = hashlib.sha256(data).hexdigest()
+        fingerprint = hashlib.sha256(json.dumps(
+            [from_key, to_key, text, seq, reply], ensure_ascii=True, separators=(",", ":")
+        ).encode("ascii")).hexdigest()
+        duplicate = self.conn.execute(
+            "SELECT * FROM messages_v2 WHERE from_key=? AND client_msg_id=?", (from_key, cid)).fetchone()
+        if duplicate:
+            if duplicate["fingerprint"] != fingerprint:
+                raise ApiError(409, "idempotency_conflict", "request ID was used with different payload or sequence")
+            return self._snapshot2(duplicate)
+        if reply:
+            previous = self._row2(reply)
+            if previous is None or previous["from_key"] != to_key or previous["to_key"] != from_key:
+                raise ApiError(409, "invalid_reply_to", "reply_to must identify the opposite direction between these peers")
+            if self._blocked2(previous):
+                raise ApiError(409, "blocked_reply_to", "reply parent is blocked by an earlier unacknowledged message")
+            if previous["text"] is None:
+                raise ApiError(409, "body_pruned", "reply parent content is no longer retained")
+        stream = self.conn.execute("SELECT last_enqueued FROM streams_v2 WHERE from_key=? AND to_key=?",
+                                   (from_key, to_key)).fetchone()
+        expected = stream["last_enqueued"] + 1 if stream else 1
+        if seq != expected:
+            raise ApiError(409, "sequence_conflict", "expected client_seq %d" % expected)
+        now, msg_id = time.time(), uuid.uuid4().hex
+        self.conn.execute(
+            "INSERT INTO messages_v2(msg_id,from_key,to_key,from_address,to_address,client_msg_id,seq,"
+            "reply_to,text,sha256,text_bytes,fingerprint,state,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (msg_id, from_key, to_key, sender["address"], target["address"], cid, seq, reply,
+             text, digest, len(data), fingerprint, "queued", now, now))
+        self.conn.execute("INSERT INTO streams_v2(from_key,to_key,last_enqueued) VALUES(?,?,?) "
+                          "ON CONFLICT(from_key,to_key) DO UPDATE SET last_enqueued=excluded.last_enqueued",
+                          (from_key, to_key, seq))
+        self._event2(msg_id, "accepted", now)
+        return self._snapshot2(self._row2(msg_id))
+
+    def _sweep2_op(self, now):
+        rows = self.conn.execute("SELECT * FROM messages_v2 WHERE state='leased' AND lease_until<? "
+                                 "AND acked_at IS NULL", (now,)).fetchall()
+        for row in rows:
+            self.conn.execute("UPDATE messages_v2 SET state='queued',lease_until=NULL WHERE msg_id=?",
+                              (row["msg_id"],))
+            self._event2(row["msg_id"], "lease_expired", now)
+        rows = self.conn.execute("SELECT msg_id FROM messages_v2 WHERE state='queued' AND created_at<? "
+                                 "AND acked_at IS NULL", (now-self.queue_ttl,)).fetchall()
+        for row in rows:
+            self.conn.execute("UPDATE messages_v2 SET state='expired',lease_until=NULL WHERE msg_id=?",
+                              (row["msg_id"],))
+            self._event2(row["msg_id"], "queue_expired_blocks_until_ack", now)
+        rows = self.conn.execute("SELECT msg_id FROM messages_v2 WHERE acked_at<? AND text IS NOT NULL",
+                                 (now-self.body_retention,)).fetchall()
+        for row in rows:
+            self.conn.execute("UPDATE messages_v2 SET text=NULL WHERE msg_id=?", (row["msg_id"],))
+            self._event2(row["msg_id"], "body_pruned", now)
+        rows = self.conn.execute("SELECT msg_id FROM messages_v2 WHERE acked_at<? AND history_pruned=0",
+                                 (now-self.event_retention,)).fetchall()
+        for row in rows:
+            # Keep the minimal state/tombstone and record the fact of pruning atomically.
+            self.conn.execute("DELETE FROM events_v2 WHERE msg_id=?", (row["msg_id"],))
+            self.conn.execute("UPDATE messages_v2 SET history_pruned=1 WHERE msg_id=?", (row["msg_id"],))
+            self._event2(row["msg_id"], "history_pruned", now)
+
+    def sweep2(self):
+        return self._write(self._sweep2_op, (time.time(),), notify=True)
+
+    def pull2(self, machine, wait):
+        machine = _need(machine, "machine", _MACHINE_RE, 64)
+        wait = _parse_wait(str(wait))
+        deadline = time.monotonic() + wait
+        with self.cond:
+            while True:
+                result = self._tx(self._lease2_op, (machine,))
+                remaining = deadline - time.monotonic()
+                if result or remaining <= 0:
+                    return result
+                self.cond.wait(min(remaining, SWEEP_INTERVAL))
+
+    def _lease2_op(self, machine):
+        now = time.time()
+        self._sweep2_op(now)
+        rows = self.conn.execute(
+            "SELECT m.* FROM messages_v2 m JOIN sessions s ON s.session_key=m.to_key "
+            "WHERE s.machine=? AND s.online=1 AND m.state='queued' AND m.acked_at IS NULL "
+            "AND NOT EXISTS(SELECT 1 FROM messages_v2 p WHERE p.from_key=m.from_key "
+            "AND p.to_key=m.to_key AND p.seq<m.seq AND p.acked_at IS NULL) "
+            "ORDER BY m.message_order LIMIT ?", (machine, PULL_BATCH)).fetchall()
+        result = []
+        for row in rows:
+            self.conn.execute("UPDATE messages_v2 SET state='leased',attempt=attempt+1,lease_until=? "
+                              "WHERE msg_id=?", (now+self.lease_seconds, row["msg_id"]))
+            self._event2(row["msg_id"], "leased", now)
+            result.append(self._snapshot2(self._row2(row["msg_id"]), full=True))
+        return result
+
+    def report2(self, body):
+        msg_id = _req_str(body, "msg_id", maxlen=128)
+        attempt = _integer(body.get("attempt"), "attempt", 1)
+        state = body.get("state")
+        if state not in ("injected", "failed", "in_doubt"):
+            raise _bad("state must be injected, failed or in_doubt")
+        detail = body.get("detail")
+        if detail is not None and (not isinstance(detail, str) or len(detail) > 2000):
+            raise _bad("detail must be a string of at most 2000 characters")
+        return self._write(self._report2_op, (msg_id, attempt, state, detail), notify=True)
+
+    def _report2_op(self, msg_id, attempt, state, detail):
+        row = self._row2(msg_id)
+        if row is None:
+            raise ApiError(404, "unknown_message", "no retained message")
+        if row["attempt"] != attempt:
+            raise ApiError(409, "stale_attempt", "report does not match current delivery attempt")
+        if row["acked_at"] is not None:
+            raise ApiError(409, "already_acknowledged", "recipient ACK cannot be rolled back")
+        if row["state"] == state and row["detail"] == detail:
+            return self._snapshot2(row)
+        if row["state"] not in ("leased", "queued"):
+            raise ApiError(409, "report_conflict", "delivery result already recorded or lease expired")
+        # Expiry alone does not prove the injection did not occur; current-attempt results
+        # remain useful until a new attempt is issued. Fencing is by attempt, never clock.
+        self.conn.execute("UPDATE messages_v2 SET state=?,detail=?,lease_until=NULL WHERE msg_id=?",
+                          (state, detail, msg_id))
+        self._event2(msg_id, "node_report")
+        return self._snapshot2(self._row2(msg_id))
+
+    def ack2(self, body):
+        msg_id = _req_str(body, "msg_id", maxlen=128)
+        session_key = _req_str(body, "session_key")
+        return self._write(self._ack2_op, (msg_id, session_key), notify=True)
+
+    def _ack2_op(self, msg_id, session_key):
+        row = self._row2(msg_id)
+        if row is None:
+            raise ApiError(404, "unknown_message", "no retained message")
+        if row["to_key"] != session_key:
+            raise ApiError(403, "wrong_recipient", "only recipient may acknowledge")
+        if row["acked_at"] is not None:
+            return self._snapshot2(row)
+        blocked = self._blocked2(row)
+        if blocked:
+            raise ApiError(409, "blocked_by", "acknowledge predecessor %s first" % blocked)
+        if row["text"] is None:
+            raise ApiError(409, "body_pruned", "full body is no longer retained")
+        now = time.time()
+        self.conn.execute("UPDATE messages_v2 SET state='acknowledged',acked_at=?,lease_until=NULL,detail=NULL "
+                          "WHERE msg_id=?", (now, msg_id))
+        self._event2(msg_id, "recipient_ack", now)
+        return self._snapshot2(self._row2(msg_id))
+
+    def status2(self, msg_id, session_key):
+        msg_id = _need(msg_id, "msg_id", maxlen=128)
+        session_key = _need(session_key, "session_key")
+        return self._read(self._status2_op, (msg_id, session_key, False))
+
+    def message2(self, msg_id, session_key):
+        msg_id = _need(msg_id, "msg_id", maxlen=128)
+        session_key = _need(session_key, "session_key")
+        return self._read(self._status2_op, (msg_id, session_key, True))
+
+    def _status2_op(self, msg_id, session_key, full):
+        row = self._participant2(msg_id, session_key)
+        return self._snapshot2(row, full) if row else self._unknown2(msg_id)
+
+    def inbox2(self, session_key, after=0, limit=50):
+        return self._read(self._inbox2_op, (_need(session_key, "session_key"),
+                          _integer(after, "after"), _integer(limit, "limit", 1, 200)))
+
+    def _inbox2_op(self, session_key, after, limit):
+        rows = self.conn.execute("SELECT * FROM messages_v2 WHERE to_key=? AND message_order>? "
+                                 "ORDER BY message_order LIMIT ?", (session_key, after, limit+1)).fetchall()
+        items = [self._snapshot2(row, True) for row in rows[:limit]]
+        return dict(items=items, next_cursor=items[-1]["message_order"] if items else after,
+                    has_more=len(rows)>limit, complete=len(rows)<=limit,
+                    ordering_scope="sender_to_receiver")
+
+    def history2(self, msg_id, session_key, after=0, limit=50):
+        return self._read(self._history2_op, (_need(msg_id, "msg_id", maxlen=128),
+                          _need(session_key, "session_key"), _integer(after, "after"),
+                          _integer(limit, "limit", 1, 200)))
+
+    def _history2_op(self, msg_id, session_key, after, limit):
+        row = self._participant2(msg_id, session_key)
+        if row is None:
+            return dict(self._unknown2(msg_id), events=[], next_cursor=after, has_more=False,
+                        complete=False, history_pruned=False)
+        rows = self.conn.execute("SELECT * FROM events_v2 WHERE msg_id=? AND event_id>? "
+                                 "ORDER BY event_id LIMIT ?", (msg_id, after, limit+1)).fetchall()
+        events = [dict(r) for r in rows[:limit]]
+        for event in events:
+            event["time"] = _iso(event["time"])
+        return dict(msg_id=msg_id, events=events, next_cursor=events[-1]["event_id"] if events else after,
+                    has_more=len(rows)>limit, complete=len(rows)<=limit and not bool(row["history_pruned"]),
+                    history_pruned=bool(row["history_pruned"]))
+
+
 class HubServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -380,7 +704,19 @@ class HubServer(ThreadingHTTPServer):
     def __init__(self, addr, hub, token):
         self.hub = hub
         self.token_bytes = token.encode("utf-8")
+        self._next_gc = 0
         ThreadingHTTPServer.__init__(self, addr, Handler)
+
+    def service_actions(self):
+        # Runs in the HTTP serve loop even with no requests; workers never run GC
+        # outside the same SQLite transaction discipline as message transitions.
+        now = time.monotonic()
+        if now >= self._next_gc:
+            self._next_gc = now + 30
+            try:
+                self.hub.sweep2()
+            except Exception as exc:
+                sys.stderr.write(json.dumps(dict(event="gc_error", error=type(exc).__name__)) + "\n")
 
 
 _ROUTES = {
@@ -391,6 +727,14 @@ _ROUTES = {
     ("GET", "/v1/pull"),
     ("POST", "/v1/report"),
     ("GET", "/v1/status"),
+    ("POST", "/v2/send"),
+    ("GET", "/v2/pull"),
+    ("POST", "/v2/report"),
+    ("POST", "/v2/ack"),
+    ("GET", "/v2/status"),
+    ("GET", "/v2/message"),
+    ("GET", "/v2/inbox"),
+    ("GET", "/v2/history"),
 }
 _PATHS = set(p for _, p in _ROUTES) | {"/v1/health"}
 
@@ -405,14 +749,18 @@ class Handler(BaseHTTPRequestHandler):
     sys_version = ""
 
     def log_request(self, code="-", size="-"):
-        # one line per request: no bodies, no headers, no tokens
+        # Approved correlation fields only, never headers, body text or raw query.
         started = getattr(self, "_started", None)
         elapsed_ms = (time.monotonic() - started) * 1000.0 if started else 0.0
         path = (getattr(self, "path", None) or "-").split("?", 1)[0]
         method = getattr(self, "command", None) or "-"
-        sys.stderr.write("%s %s %s %s %s %.1fms\n" % (
-            time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), method, path, code,
-            self.client_address[0] if self.client_address else "-", elapsed_ms))
+        record = dict(event="http_request", time=_iso(time.time()), method=method,
+                      path=path if path in _PATHS else "unknown", status=code,
+                      request_id=getattr(self, "_request_id", None),
+                      msg_id=getattr(self, "_msg_id", None),
+                      client_msg_id=getattr(self, "_client_msg_id", None),
+                      elapsed_ms=round(elapsed_ms, 1))
+        sys.stderr.write(json.dumps(record, separators=(",", ":")) + "\n")
         sys.stderr.flush()
 
     def do_GET(self):
@@ -450,21 +798,27 @@ class Handler(BaseHTTPRequestHandler):
         return obj
 
     def _send_json(self, status, payload):
+        if isinstance(payload, dict) and payload.get("msg_id"):
+            self._msg_id = payload["msg_id"]
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        if getattr(self, "_request_id", None):
+            self.send_header("X-Request-ID", self._request_id)
         self.end_headers()
         self.wfile.write(data)
 
     def _dispatch(self, method):
         self._started = time.monotonic()
+        self._request_id = uuid.uuid4().hex
+        self._msg_id = self._client_msg_id = None
         url = urlsplit(self.path)
         path = url.path
         try:
             if method == "GET" and path == "/v1/health":
-                self._send_json(200, {"ok": True, "version": VERSION})
+                self._send_json(200, {"ok": True, "version": VERSION, "protocols": [1, 2]})
                 return
             if path not in _PATHS:
                 raise ApiError(404, "not_found", "no such endpoint")
@@ -476,14 +830,27 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, payload)
         except ApiError as e:
             self._send_json(e.status, {"error": e.code, "message": e.message})
-        except Exception:
-            traceback.print_exc()
+        except Exception as exc:
+            sys.stderr.write(json.dumps(dict(event="request_error", request_id=self._request_id,
+                                            error=type(exc).__name__)) + "\n")
             self._send_json(500, {"error": "internal", "message": "internal error"})
 
     def _handle(self, method, path, query_string):
         hub = self.server.hub
         if method == "GET":
             query = parse_qs(query_string, keep_blank_values=True)
+            self._msg_id = _qs(query, "msg_id")
+            if path == "/v2/pull":
+                return {"messages": hub.pull2(_qs(query, "machine"), _parse_wait(_qs(query, "wait")))}
+            if path in ("/v2/status", "/v2/message"):
+                call = hub.status2 if path == "/v2/status" else hub.message2
+                return call(_qs(query, "msg_id"), _qs(query, "session_key"))
+            if path == "/v2/inbox":
+                return hub.inbox2(_qs(query, "session_key"), _qs(query, "after") or 0,
+                                  _qs(query, "limit") or 50)
+            if path == "/v2/history":
+                return hub.history2(_qs(query, "msg_id"), _qs(query, "session_key"),
+                                    _qs(query, "after") or 0, _qs(query, "limit") or 50)
             if path == "/v1/peers":
                 return hub.peers()
             if path == "/v1/pull":
@@ -500,6 +867,14 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(405, "method_not_allowed", "method not allowed for this endpoint")
 
         body = self._read_body()
+        self._msg_id = body.get("msg_id") if isinstance(body.get("msg_id"), str) else None
+        self._client_msg_id = body.get("client_msg_id") if isinstance(body.get("client_msg_id"), str) else None
+        if path == "/v2/send":
+            return hub.send2(body)
+        if path == "/v2/report":
+            return hub.report2(body)
+        if path == "/v2/ack":
+            return hub.ack2(body)
         if path == "/v1/register":
             return hub.register(body)
         if path == "/v1/heartbeat":
@@ -525,13 +900,15 @@ def _parse_wait(raw):
 
 
 def make_server(db_path, token, host="127.0.0.1", port=DEFAULT_PORT,
-                lease_seconds=LEASE_SECONDS, queue_ttl=QUEUE_TTL_SECONDS):
+                lease_seconds=LEASE_SECONDS, queue_ttl=QUEUE_TTL_SECONDS,
+                body_retention_days=7, event_retention_days=30):
     """Build (but do not run) a hub server. server.hub is the Hub; port 0 = ephemeral."""
     if host not in LOOPBACK_HOSTS:
         raise ValueError("hub must bind a loopback address (127.0.0.1), not %r" % host)
     if not token:
         raise ValueError("token must be non-empty")
-    hub = Hub(db_path, lease_seconds=lease_seconds, queue_ttl=queue_ttl)
+    hub = Hub(db_path, lease_seconds=lease_seconds, queue_ttl=queue_ttl,
+              body_retention_days=body_retention_days, event_retention_days=event_retention_days)
     try:
         return HubServer((host, port), hub, token)
     except BaseException:
@@ -547,9 +924,11 @@ def _read_token(token_file):
     return token
 
 
-def serve(db_path, token_file, host="127.0.0.1", port=DEFAULT_PORT):
+def serve(db_path, token_file, host="127.0.0.1", port=DEFAULT_PORT,
+          body_retention_days=7, event_retention_days=30):
     token = _read_token(token_file)
-    server = make_server(db_path, token, host=host, port=port)
+    server = make_server(db_path, token, host=host, port=port,
+                         body_retention_days=body_retention_days, event_retention_days=event_retention_days)
     sys.stderr.write("agentbus hub %s listening on %s:%d db=%s\n"
                      % (VERSION, host, server.server_address[1], db_path))
     sys.stderr.flush()
@@ -566,9 +945,14 @@ def main(argv=None):
     parser.add_argument("--token-file", required=True, help="file containing the bearer token")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--body-retention-days", type=_positive_days, default=7,
+                        help="prune ACKed message bodies after this many days (default: 7)")
+    parser.add_argument("--event-retention-days", type=_positive_days, default=30,
+                        help="prune ACKed message history after this many days (default: 30)")
     args = parser.parse_args(argv)
     try:
-        serve(args.db, args.token_file, host=args.host, port=args.port)
+        serve(args.db, args.token_file, host=args.host, port=args.port,
+              body_retention_days=args.body_retention_days, event_retention_days=args.event_retention_days)
     except KeyboardInterrupt:
         return 0
     except (OSError, ValueError, sqlite3.Error) as e:

@@ -27,10 +27,9 @@ import tempfile
 import threading
 import time
 import traceback
-import uuid
 
 SERVER_NAME = "agentbus"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 MAX_TEXT_BYTES = 64 * 1024
 NODE_TIMEOUT = 10.0
@@ -319,9 +318,40 @@ def tool_peers(sess, args):
     return "\n".join("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)).rstrip() for r in rows)
 
 
+def _receipt(resp, operation, request_id=None):
+    result = {k: v for k, v in resp.items() if k != "ok"}
+    if request_id is not None:
+        result["request_id"] = request_id
+    if not result.get("summary"):
+        if result.get("receiver_acknowledged"):
+            summary = "Recipient explicitly acknowledged receipt; this does not confirm task completion."
+        elif result.get("state") == "unknown_or_pruned":
+            summary = "Unknown or pruned message; this does not prove it was never sent or received."
+        elif operation == "send2":
+            summary = ("Hub accepted the message; recipient receipt remains unconfirmed."
+                       if result.get("submission") == "accepted" else
+                       "Submission pending or unknown; retry only with the same request_id and payload.")
+        elif result.get("state") in ("unknown", "in_doubt", "injecting"):
+            summary = "Outcome remains unknown or uncertain; receipt is unconfirmed. Do not infer no delivery."
+        elif operation == "ack2":
+            summary = "Acknowledgement outcome is unconfirmed; inspect message status."
+        elif operation == "message2" and result.get("body_retained") is False:
+            summary = "Message body is not retained; metadata retrieval does not acknowledge receipt."
+        elif operation in ("message2", "inbox2"):
+            summary = "Retrieved available message data; retrieval does not acknowledge receipt."
+        elif operation == "history2":
+            summary = "Retrieved available history; inspect pagination and pruning fields."
+        else:
+            summary = "Observed transport status; recipient receipt and task completion are separate."
+        result["summary"] = summary
+    return result
+
+
 def tool_send(sess, args):
     to = _str_arg(args, "to")
     text = _str_arg(args, "text")
+    request_id = _str_arg(args, "request_id")
+    reply_to = _str_arg(args, "reply_to") if "reply_to" in args else None
     if len(text.encode("utf-8")) > MAX_TEXT_BYTES:
         raise ToolError("too_large: text exceeds %d bytes" % MAX_TEXT_BYTES)
     reg = require_registered(sess)
@@ -332,21 +362,57 @@ def tool_send(sess, args):
             "same_machine_same_harness: %s is on this machine with the same harness (%s). agentbus is for "
             "other machines or other harnesses; use the harness's own messaging for it (Claude Code: "
             "ListAgents to find the session, then SendMessage)." % (to, own[1]))
-    resp = node_call({
-        "op": "send",
-        "session_key": reg["session_key"],
-        "to": to,
-        "text": text,
-        "client_msg_id": str(uuid.uuid4()),
-    })
-    return {"msg_id": resp.get("msg_id"), "target": resp.get("target"),
-            "target_online": resp.get("target_online")}
+    try:
+        resp = node_call({"op": "send2", "session_key": reg["session_key"], "to": to,
+                          "text": text, "client_msg_id": request_id, "reply_to": reply_to})
+    except NodeError as e:
+        raise NodeError(e.code, "%s; request_id=%s. Submission may be unknown. Retry with this SAME "
+                        "request_id and identical to/text/reply_to; do not allocate a new ID." % (e, request_id))
+    return _receipt(resp, "send2", request_id)
 
 
 def tool_status(sess, args):
-    msg_id = _str_arg(args, "msg_id")
-    resp = node_call({"op": "status", "msg_id": msg_id})
-    return {k: v for k, v in resp.items() if k != "ok"}
+    if ("msg_id" in args) == ("request_id" in args):
+        raise ToolError("invalid_arguments: provide exactly one of msg_id or request_id")
+    reg = require_registered(sess)
+    key = "msg_id" if "msg_id" in args else "request_id"
+    value = _str_arg(args, key)
+    resp = node_call({"op": "status2", "session_key": reg["session_key"],
+                      "msg_id" if key == "msg_id" else "client_msg_id": value})
+    return _receipt(resp, "status2", value if key == "request_id" else None)
+
+
+def _page_args(args):
+    after, limit = args.get("after", 0), args.get("limit", 50)
+    if type(after) is not int or after < 0 or type(limit) is not int or not 1 <= limit <= 200:
+        raise ToolError("invalid_arguments: after must be a nonnegative integer; limit must be 1-200")
+    return {"after": after, "limit": limit}
+
+
+def _message_op(sess, args, op, paged=False):
+    req = {"op": op}
+    if op != "inbox2":
+        req["msg_id"] = _str_arg(args, "msg_id")
+    if paged:
+        req.update(_page_args(args))
+    req["session_key"] = require_registered(sess)["session_key"]
+    return _receipt(node_call(req), op)
+
+
+def tool_ack(sess, args):
+    return _message_op(sess, args, "ack2")
+
+
+def tool_message(sess, args):
+    return _message_op(sess, args, "message2")
+
+
+def tool_inbox(sess, args):
+    return _message_op(sess, args, "inbox2", paged=True)
+
+
+def tool_history(sess, args):
+    return _message_op(sess, args, "history2", paged=True)
 
 
 def tool_rename(sess, args):
@@ -379,20 +445,26 @@ TOOLS = {
         "description": "Send a text message to a peer by exact address or session key. Only for a peer on another "
                        "machine or with another harness: a peer on this machine with the same harness is refused "
                        "(same_machine_same_harness); use the harness's own messaging for it (Claude Code: "
-                       "ListAgents to find the session, SendMessage to message it).",
+                       "ListAgents to find the session, SendMessage to message it). Requires a stable caller-generated request_id; "
+                       "retry with the SAME ID and identical payload after uncertainty. reply_to associates a reply "
+                       "with the exact received msg_id. Hub acceptance is not recipient ACK or task completion.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "to": {"type": "string", "description": "Exact address (machine/harness/name) or session_key."},
-                "text": {"type": "string", "description": "Message text, at most 64 KiB."},
+                "text": {"type": "string", "description": "Full message text, at most 64 KiB."},
+                "request_id": {"type": "string", "minLength": 1, "description": "Stable caller-generated retry key."},
+                "reply_to": {"type": "string", "minLength": 1, "description": "Exact received msg_id being answered."},
             },
-            "required": ["to", "text"], "additionalProperties": False}}),
+            "required": ["to", "text", "request_id"], "additionalProperties": False}}),
     "agentbus_status": (tool_status, {
-        "description": "Get the delivery state of a message sent with agentbus_send.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {"msg_id": {"type": "string"}},
-            "required": ["msg_id"], "additionalProperties": False}}),
+        "description": "Observe message transport and explicit recipient ACK state by msg_id OR request_id. "
+                       "Unknown is not proof of no delivery; ACK does not mean task completion.",
+        "inputSchema": {"type": "object", "properties": {
+            "msg_id": {"type": "string", "minLength": 1},
+            "request_id": {"type": "string", "minLength": 1}},
+            "oneOf": [{"required": ["msg_id"]}, {"required": ["request_id"]}],
+            "additionalProperties": False}}),
     "agentbus_rename": (tool_rename, {
         "description": "Set a friendlier name for this session (changes its address).",
         "inputSchema": {
@@ -402,8 +474,26 @@ TOOLS = {
 }
 
 
-def tool_result(text, is_error):
-    return {"content": [{"type": "text", "text": text}], "isError": is_error}
+for _name, _fn, _description, _has_id, _paged in [
+    ("ack", tool_ack, "Explicitly acknowledge receipt after reading the full envelope. This is not task completion.", True, False),
+    ("message", tool_message, "Retrieve full retained message and envelope. Does not automatically ACK.", True, False),
+    ("inbox", tool_inbox, "Retrieve received messages with cursor pagination. Does not automatically ACK.", False, True),
+    ("history", tool_history, "Retrieve message events with cursor pagination and explicit pruning information.", True, True),
+]:
+    _properties = {"msg_id": {"type": "string", "minLength": 1}} if _has_id else {}
+    if _paged:
+        _properties.update({"after": {"type": "integer", "minimum": 0, "default": 0},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50}})
+    TOOLS["agentbus_" + _name] = (_fn, {"description": _description, "inputSchema": {
+        "type": "object", "properties": _properties, "required": ["msg_id"] if _has_id else [],
+        "additionalProperties": False}})
+
+
+def tool_result(value, is_error):
+    result = {"content": [{"type": "text", "text": _result_text(value)}], "isError": is_error}
+    if isinstance(value, dict):
+        result["structuredContent"] = value
+    return result
 
 
 def _result_text(value):
@@ -443,9 +533,12 @@ def handle_tools_call(sess, params):
 
     fn = TOOLS[name][0]
     try:
-        return tool_result(_result_text(fn(sess, args)), False)
+        return tool_result(fn(sess, args), False)
     except ToolError as e:
-        return tool_result("agentbus error: %s" % e, True)
+        error = {"error": getattr(e, "code", str(e).split(":", 1)[0]), "summary": "agentbus error: %s" % e}
+        if name == "agentbus_send" and isinstance(args.get("request_id"), str):
+            error["request_id"] = args["request_id"]
+        return tool_result(error, True)
     except Exception as e:  # noqa: BLE001 - report, do not kill the MCP
         log("tool %s failed: %s" % (name, traceback.format_exc()))
         return tool_result("agentbus internal error: %s" % e, True)

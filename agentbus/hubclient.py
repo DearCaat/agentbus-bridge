@@ -107,3 +107,28 @@ class HubClient:
 
     def status(self, msg_id):
         return self._call("GET", "/v1/status", query={"msg_id": msg_id})
+
+    # Reliability protocol 2 never silently downgrades to v1.
+    def send2(self, body):
+        return self._call('POST', '/v2/send', body=body)
+
+    def pull2(self, machine, wait=1):
+        return self._call('GET', '/v2/pull', query={'machine': machine, 'wait': wait}, timeout=wait + 10)
+
+    def report2(self, body):
+        return self._call('POST', '/v2/report', body=body)
+
+    def ack2(self, body):
+        return self._call('POST', '/v2/ack', body=body)
+
+    def status2(self, msg_id, session_key):
+        return self._call('GET', '/v2/status', query={'msg_id': msg_id, 'session_key': session_key})
+
+    def message2(self, msg_id, session_key):
+        return self._call('GET', '/v2/message', query={'msg_id': msg_id, 'session_key': session_key})
+
+    def inbox2(self, session_key, after=0, limit=50):
+        return self._call('GET', '/v2/inbox', query={'session_key': session_key, 'after': after, 'limit': limit})
+
+    def history2(self, msg_id, session_key, after=0, limit=50):
+        return self._call('GET', '/v2/history', query={'msg_id': msg_id, 'session_key': session_key, 'after': after, 'limit': limit})

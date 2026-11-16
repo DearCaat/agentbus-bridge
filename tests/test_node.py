@@ -398,7 +398,9 @@ class TestInjection(NodeTestCase):
         self.hub.push(self.claude_message("m-codex-bad", r["session_key"]))
         self.assertTrue(wait_for(lambda: self.hub.reported("m-codex-bad", "failed")))
         detail = [x[2] for x in self.hub.reports if x[0] == "m-codex-bad"][0]
-        self.assertIn("boom", detail)
+        self.assertTrue(detail.startswith("in_doubt:"))
+        self.assertIn("exit 3", detail)
+        self.assertNotIn("boom", detail)
 
     def test_duplicate_msg_id_injected_once(self):
         self.start_node()
