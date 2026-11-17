@@ -208,14 +208,17 @@ class TestProtocol(McpTestBase):
                                     "clientInfo": {"name": "t", "version": "0"}})
         res = msg["result"]
         self.assertEqual(res["protocolVersion"], "2025-06-18")
-        self.assertEqual(res["serverInfo"], {"name": "agentbus", "version": "0.3.1"})
+        self.assertEqual(res["serverInfo"], {"name": "agentbus", "version": "0.4.0"})
         self.assertIn("tools", res["capabilities"])
+        metadata=res['capabilities']['experimental']['agentbus']
+        self.assertTrue(metadata['runtime_id'])
+        self.assertIn('reload_generation',metadata)
 
-    def test_tools_list_has_nine_tools_with_schemas(self):
+    def test_tools_list_includes_native_control_schemas(self):
         self.start_node()
         m = self.start_mcp(extra_env={"CLAUDE_CODE_SESSION_ID": CLAUDE_SID})
         tools = {t["name"]: t for t in m.rpc("tools/list")["result"]["tools"]}
-        self.assertEqual(sorted(tools), ["agentbus_ack", "agentbus_history", "agentbus_inbox", "agentbus_message",
+        self.assertEqual(sorted(tools), ["agentbus_ack", "agentbus_control", "agentbus_control_status", "agentbus_history", "agentbus_inbox", "agentbus_message",
                                          "agentbus_peers", "agentbus_rename", "agentbus_send",
                                          "agentbus_status", "agentbus_whoami"])
         for t in tools.values():

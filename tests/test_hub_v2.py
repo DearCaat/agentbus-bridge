@@ -511,7 +511,7 @@ class HubV2HTTPTests(unittest.TestCase):
 
     def test_http_validation_health_and_periodic_maintenance_hook(self):
         self.assertEqual(self.call("GET", "/v1/health", authorized=False)[1]["protocols"], [1, 2])
-        self.assertEqual(self.call("GET", "/v1/health", authorized=False)[1]["capabilities"], ["durable_receipts"])
+        self.assertEqual(self.call("GET", "/v1/health", authorized=False)[1]["capabilities"], ["durable_receipts", "native_controls"])
         self.assertEqual(self.call("GET", "/v2/inbox?session_key=x&limit=-1")[0], 400)
         self.assertEqual(self.call("GET", "/v2/history?msg_id=x&session_key=x&after=nan")[0], 400)
         observed = threading.Event()

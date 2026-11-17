@@ -174,6 +174,74 @@ CREATE TABLE IF NOT EXISTS events_v2 (
 CREATE INDEX IF NOT EXISTS events_v2_message ON events_v2(msg_id,event_id);
 """
 
+CONTROL_ACTIONS = ("reload_plugins", "reload_mcp")
+CONTROL_TERMINAL = ("verified", "applied_unverified", "unsupported", "failed", "in_doubt", "expired")
+CONTROL_RESULT_KEYS = frozenset(("code", "summary", "harness", "effective_scope", "target_session_key",
+    "target_thread_id", "runtime_identity", "verification", "observed", "affected_servers",
+    "native_accepted", "applied", "verified", "capabilities"))
+CONTROL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS control_jobs (
+ control_order INTEGER PRIMARY KEY AUTOINCREMENT, control_id TEXT NOT NULL UNIQUE,
+ from_key TEXT NOT NULL, to_key TEXT NOT NULL, from_address TEXT NOT NULL, to_address TEXT NOT NULL,
+ request_id TEXT NOT NULL, action TEXT NOT NULL, scope TEXT NOT NULL,
+ fingerprint TEXT NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0,
+ owner TEXT, lease_until REAL, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+ started_at REAL, terminal_at REAL, result TEXT, result_fingerprint TEXT,
+ state_revision INTEGER NOT NULL DEFAULT 0, history_pruned INTEGER NOT NULL DEFAULT 0,
+ result_pruned INTEGER NOT NULL DEFAULT 0, UNIQUE(from_key,request_id)
+);
+CREATE INDEX IF NOT EXISTS control_jobs_pending ON control_jobs(state,control_order);
+CREATE TABLE IF NOT EXISTS control_events (
+ event_id INTEGER PRIMARY KEY AUTOINCREMENT, control_id TEXT NOT NULL,
+ time REAL NOT NULL, state TEXT NOT NULL, attempt INTEGER NOT NULL,
+ owner TEXT, reason TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS control_events_job ON control_events(control_id,event_id);
+"""
+
+
+def _control_result(result):
+    if not isinstance(result, dict) or any(key not in CONTROL_RESULT_KEYS for key in result):
+        raise _bad("control result must be a dictionary of approved metadata fields")
+    for key in ("native_accepted", "applied", "verified"):
+        if key in result and result[key] is not None and type(result[key]) is not bool:
+            raise _bad("control confirmation fields must be boolean or null")
+    def check(value, depth=0):
+        if depth > 6:
+            raise _bad("control result nesting exceeds limit")
+        if isinstance(value, dict):
+            if len(value) > 64:
+                raise _bad("control result object exceeds limit")
+            for key, item in value.items():
+                if not isinstance(key, str) or not 1 <= len(key) <= 128:
+                    raise _bad("invalid control result key")
+                if re.search(r"token|authorization|env|config|raw|body|command|shell|args", key, re.I):
+                    raise _bad("control result contains a prohibited metadata field")
+                check(item, depth+1)
+        elif isinstance(value, list):
+            if len(value) > 128:
+                raise _bad("control result array exceeds limit")
+            for item in value:
+                check(item, depth+1)
+        elif isinstance(value, str):
+            if len(value) > 2048:
+                raise _bad("control result string exceeds limit")
+        elif value is None or type(value) is bool:
+            pass
+        elif type(value) is int:
+            if abs(value) > 2**63 - 1:
+                raise _bad("control result integer exceeds limit")
+        elif type(value) is float:
+            if not math.isfinite(value):
+                raise _bad("control result number must be finite")
+        else:
+            raise _bad("control result must contain JSON metadata only")
+    check(result)
+    encoded = json.dumps(result, ensure_ascii=True, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    if len(encoded.encode("ascii")) > 16 * 1024:
+        raise ApiError(413, "too_large", "control result exceeds 16 KiB")
+    return encoded
+
 
 class ApiError(Exception):
     def __init__(self, status, code, message):
@@ -250,6 +318,7 @@ class Hub(object):
         self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.executescript(SCHEMA)
         self.conn.executescript(SCHEMA_V2)
+        self.conn.executescript(CONTROL_SCHEMA)
         self._write(self._migrate_receipts_op)
 
     def _migrate_receipts_op(self):
@@ -670,7 +739,11 @@ class Hub(object):
             self._event2(row["msg_id"], "history_pruned", now)
 
     def sweep2(self):
-        return self._write(self._sweep2_op, (time.time(),), notify=True)
+        return self._write(self._sweep_all_op, (time.time(),), notify=True)
+
+    def _sweep_all_op(self, now):
+        self._sweep2_op(now)
+        self._control_sweep_op(now)
 
     def pull2(self, machine, wait):
         machine = _need(machine, "machine", _MACHINE_RE, 64)
@@ -827,6 +900,193 @@ class Hub(object):
                     history_pruned=bool(row["history_pruned"]))
 
 
+    # -- fixed native controls: independent from message receipt/FIFO ----------
+
+    def _control_row(self, control_id):
+        return self.conn.execute("SELECT * FROM control_jobs WHERE control_id=?", (control_id,)).fetchone()
+
+    def _control_event(self, control_id, reason, now=None):
+        row = self._control_row(control_id)
+        now = time.time() if now is None else now
+        cur = self.conn.execute("INSERT INTO control_events(control_id,time,state,attempt,owner,reason) VALUES(?,?,?,?,?,?)",
+                                (control_id, now, row["state"], row["attempt"], row["owner"], reason))
+        self.conn.execute("UPDATE control_jobs SET state_revision=?,updated_at=? WHERE control_id=?",
+                          (cur.lastrowid, now, control_id))
+
+    def _control_snapshot(self, row):
+        state = row["state"]
+        execution = True if state in ("verified", "applied_unverified") else None if state in ("executing", "in_doubt") else False
+        summaries = {
+            "queued": "Hub stored the control request; no native execution is confirmed.",
+            "leased": "Receiver node claimed the request; no native execution is confirmed.",
+            "executing": "Execution barrier committed; native outcome is not yet known. Do not automatically rerun.",
+            "verified": "Receiver reports native execution and target-runtime verification.",
+            "applied_unverified": "Native refresh was accepted; target-runtime application is not verified.",
+            "unsupported": "Receiver reports unsupported capability or scope; native action was not executed.",
+            "failed": "Receiver reports a definite failure; successful native execution is not confirmed.",
+            "in_doubt": "Native execution outcome is unknown; do not automatically rerun.",
+            "expired": "Queued request expired before execution.",
+        }
+        out = {key: row[key] for key in ("control_id", "request_id", "from_key", "to_key", "from_address",
+            "to_address", "action", "scope", "state", "attempt", "owner", "state_revision", "result_fingerprint")}
+        out.update(created_at=_iso(row["created_at"]), updated_at=_iso(row["updated_at"]),
+                   started_at=_iso(row["started_at"]), terminal_at=_iso(row["terminal_at"]),
+                   result=json.loads(row["result"]) if row["result"] is not None else None,
+                   execution_confirmed=execution, verification_confirmed=state == "verified",
+                   history_pruned=bool(row["history_pruned"]), result_pruned=bool(row["result_pruned"]),
+                   summary=summaries[state], observed_at=_iso(time.time()))
+        return out
+
+    def control_submit2(self, body):
+        # No extension bag or native request parameters: these five fields are
+        # the complete control language, and native adapters own the invocation.
+        if set(body) - {"from_key", "to", "request_id", "action", "scope"}:
+            raise _bad("unexpected control submission fields")
+        from_key, to = _req_str(body, "from_key"), _req_str(body, "to")
+        request_id = _req_str(body, "request_id", maxlen=200)
+        action, scope = body.get("action"), body.get("scope")
+        if action not in CONTROL_ACTIONS or scope not in ("session", "server"):
+            raise _bad("control action or scope is not allowed")
+        return self._write(self._control_submit_op, (from_key, to, request_id, action, scope), notify=True)
+
+    def _control_submit_op(self, from_key, to, request_id, action, scope):
+        sender, target = self._resolve(from_key), self._resolve(to)
+        if sender is None or sender["session_key"] != from_key:
+            raise ApiError(404, "unknown_sender", "control caller is not registered")
+        if target is None:
+            raise ApiError(404, "unknown_target", "exact control target is not registered")
+        fingerprint = hashlib.sha256(json.dumps([from_key, target["session_key"], action, scope],
+                                                separators=(",", ":")).encode("ascii")).hexdigest()
+        previous = self.conn.execute("SELECT * FROM control_jobs WHERE from_key=? AND request_id=?",
+                                     (from_key, request_id)).fetchone()
+        if previous:
+            if previous["fingerprint"] != fingerprint:
+                raise ApiError(409, "idempotency_conflict", "control request ID was used with different target, action or scope")
+            return self._control_snapshot(previous)
+        now, control_id = time.time(), uuid.uuid4().hex
+        self.conn.execute("INSERT INTO control_jobs(control_id,from_key,to_key,from_address,to_address,request_id,"
+                          "action,scope,fingerprint,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'queued',?,?)",
+                          (control_id, from_key, target["session_key"], sender["address"], target["address"],
+                           request_id, action, scope, fingerprint, now, now))
+        self._control_event(control_id, "accepted", now)
+        return self._control_snapshot(self._control_row(control_id))
+
+    def _control_sweep_op(self, now):
+        rows = self.conn.execute("SELECT control_id FROM control_jobs WHERE state='leased' AND lease_until<?", (now,)).fetchall()
+        for row in rows:
+            self.conn.execute("UPDATE control_jobs SET state='queued',owner=NULL,lease_until=NULL WHERE control_id=?", (row["control_id"],))
+            self._control_event(row["control_id"], "lease_expired_before_begin", now)
+        rows = self.conn.execute("SELECT control_id FROM control_jobs WHERE state='queued' AND created_at<?", (now-300,)).fetchall()
+        for row in rows:
+            self.conn.execute("UPDATE control_jobs SET state='expired',terminal_at=? WHERE control_id=?", (now,row["control_id"]))
+            self._control_event(row["control_id"], "queued_ttl_expired", now)
+        # Executing is intentionally absent from every reoffer/expiry predicate.
+        rows = self.conn.execute("SELECT control_id FROM control_jobs WHERE terminal_at<? AND history_pruned=0",
+                                 (now-30*86400,)).fetchall()
+        for row in rows:
+            self.conn.execute("DELETE FROM control_events WHERE control_id=?", (row["control_id"],))
+            self.conn.execute("UPDATE control_jobs SET history_pruned=1,result_pruned=CASE WHEN result IS NULL THEN 0 ELSE 1 END,"
+                              "result=NULL WHERE control_id=?", (row["control_id"],))
+            self._control_event(row["control_id"], "history_pruned", now)
+
+    def control_pull2(self, machine, owner):
+        machine = _need(machine, "machine", _MACHINE_RE, 64)
+        owner = _need(owner, "owner", maxlen=200)
+        return self._write(self._control_pull_op, (machine, owner), notify=True)
+
+    def _control_pull_op(self, machine, owner):
+        now = time.time()
+        self._control_sweep_op(now)
+        rows = self.conn.execute("SELECT c.control_id FROM control_jobs c JOIN sessions s ON s.session_key=c.to_key "
+                                 "WHERE s.machine=? AND c.state='queued' ORDER BY c.control_order LIMIT ?",
+                                 (machine, PULL_BATCH)).fetchall()
+        result = []
+        for row in rows:
+            self.conn.execute("UPDATE control_jobs SET state='leased',attempt=attempt+1,owner=?,lease_until=? WHERE control_id=?",
+                              (owner, now+self.lease_seconds, row["control_id"]))
+            self._control_event(row["control_id"], "claimed", now)
+            result.append(self._control_snapshot(self._control_row(row["control_id"])))
+        return result
+
+    def _control_owned(self, control_id, owner, attempt):
+        row = self._control_row(control_id)
+        if row is None:
+            raise ApiError(404, "unknown_control", "no retained control job")
+        if row["owner"] != owner or row["attempt"] != attempt:
+            raise ApiError(409, "stale_attempt", "control owner or attempt does not match")
+        return row
+
+    def control_begin2(self, body):
+        return self._write(self._control_begin_op, (_req_str(body, "control_id", maxlen=128),
+                          _req_str(body, "owner", maxlen=200), _integer(body.get("attempt"), "attempt", 1)), notify=True)
+
+    def _control_begin_op(self, control_id, owner, attempt):
+        row = self._control_owned(control_id, owner, attempt)
+        if row["state"] == "executing":
+            return self._control_snapshot(row)
+        if row["state"] != "leased":
+            raise ApiError(409, "control_state_conflict", "only a currently leased control can begin")
+        now = time.time()
+        self.conn.execute("UPDATE control_jobs SET state='executing',started_at=?,lease_until=NULL WHERE control_id=?",
+                          (now, control_id))
+        self._control_event(control_id, "execution_barrier", now)
+        return self._control_snapshot(self._control_row(control_id))
+
+    def control_report2(self, body):
+        control_id, owner = _req_str(body, "control_id", maxlen=128), _req_str(body, "owner", maxlen=200)
+        attempt = _integer(body.get("attempt"), "attempt", 1)
+        state = body.get("state")
+        if state not in ("verified", "applied_unverified", "unsupported", "failed", "in_doubt"):
+            raise _bad("invalid control result state")
+        result = body.get("result")
+        encoded = _control_result(result)
+        if state == "verified" and (result.get("verified") is not True or result.get("native_accepted") is False):
+            raise _bad("verified state requires an explicit verified native observation")
+        if state == "applied_unverified" and (result.get("native_accepted") is not True or result.get("verified") is True):
+            raise _bad("applied_unverified requires native acceptance without verified application")
+        if state not in ("verified", "applied_unverified") and (result.get("verified") is True or result.get("native_accepted") is True or result.get("applied") is True):
+            raise _bad("control result contradicts reported execution state")
+        fingerprint = hashlib.sha256(encoded.encode("ascii")).hexdigest()
+        return self._write(self._control_report_op, (control_id, owner, attempt, state, encoded, fingerprint), notify=True)
+
+    def _control_report_op(self, control_id, owner, attempt, state, encoded, fingerprint):
+        row = self._control_owned(control_id, owner, attempt)
+        if row["state"] in CONTROL_TERMINAL:
+            if row["state"] == state and row["result_fingerprint"] == fingerprint:
+                return self._control_snapshot(row)
+            raise ApiError(409, "control_result_conflict", "a different terminal control result is already retained")
+        if row["state"] == "leased":
+            allowed = ("unsupported", "failed")
+        elif row["state"] == "executing":
+            allowed = ("verified", "applied_unverified", "unsupported", "failed", "in_doubt")
+            if state == "unsupported":
+                result = json.loads(encoded)
+                if result.get("native_accepted") is not False or result.get("verified") is not False:
+                    raise _bad("unsupported after begin requires explicit native_accepted=false and verified=false")
+        else:
+            allowed = ()
+        if state not in allowed:
+            raise ApiError(409, "control_state_conflict", "control result is invalid for the execution phase")
+        now = time.time()
+        self.conn.execute("UPDATE control_jobs SET state=?,result=?,result_fingerprint=?,terminal_at=?,lease_until=NULL WHERE control_id=?",
+                          (state, encoded, fingerprint, now, control_id))
+        self._control_event(control_id, "receiver_result", now)
+        return self._control_snapshot(self._control_row(control_id))
+
+    def control_status2(self, control_id, session_key):
+        return self._read(self._control_status_op, (_need(control_id, "control_id", maxlen=128), _need(session_key, "session_key")))
+
+    def _control_status_op(self, control_id, session_key):
+        row = self._control_row(control_id)
+        if row is None:
+            return dict(control_id=control_id, state="unknown_or_pruned", result=None,
+                        execution_confirmed=None, verification_confirmed=None,
+                        summary="No retained control record; execution is unknown.", observed_at=_iso(time.time()))
+        if session_key not in (row["from_key"], row["to_key"]):
+            raise ApiError(403, "not_participant", "session is not a control participant")
+        return self._control_snapshot(row)
+
+
 class HubServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
@@ -874,6 +1134,11 @@ _ROUTES = {
     ("GET", "/v2/message"),
     ("GET", "/v2/inbox"),
     ("GET", "/v2/history"),
+    ("POST", "/v2/control/submit"),
+    ("GET", "/v2/control/pull"),
+    ("POST", "/v2/control/begin"),
+    ("POST", "/v2/control/report"),
+    ("GET", "/v2/control/status"),
 }
 _PATHS = set(p for _, p in _ROUTES) | {"/v1/health"}
 
@@ -897,6 +1162,7 @@ class Handler(BaseHTTPRequestHandler):
                       path=path if path in _PATHS else "unknown", status=code,
                       request_id=getattr(self, "_request_id", None),
                       msg_id=getattr(self, "_msg_id", None),
+                      control_id=getattr(self, "_control_id", None),
                       client_msg_id=getattr(self, "_client_msg_id", None),
                       elapsed_ms=round(elapsed_ms, 1))
         self.server.log.write(record)
@@ -938,6 +1204,8 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(self, status, payload):
         if isinstance(payload, dict) and payload.get("msg_id"):
             self._msg_id = payload["msg_id"]
+        if isinstance(payload, dict) and payload.get("control_id"):
+            self._control_id = payload["control_id"]
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -952,12 +1220,13 @@ class Handler(BaseHTTPRequestHandler):
         self._started = time.monotonic()
         self._request_id = uuid.uuid4().hex
         self._msg_id = self._client_msg_id = None
+        self._control_id = None
         url = urlsplit(self.path)
         path = url.path
         try:
             if method == "GET" and path == "/v1/health":
                 self._send_json(200, {"ok": True, "version": VERSION, "protocols": [1, 2],
-                                      "capabilities": ["durable_receipts"]})
+                                      "capabilities": ["durable_receipts", "native_controls"]})
                 return
             if path not in _PATHS:
                 raise ApiError(404, "not_found", "no such endpoint")
@@ -979,6 +1248,11 @@ class Handler(BaseHTTPRequestHandler):
         if method == "GET":
             query = parse_qs(query_string, keep_blank_values=True)
             self._msg_id = _qs(query, "msg_id")
+            self._control_id = _qs(query, "control_id")
+            if path == "/v2/control/pull":
+                return {"controls": hub.control_pull2(_qs(query, "machine"), _qs(query, "owner"))}
+            if path == "/v2/control/status":
+                return hub.control_status2(_qs(query, "control_id"), _qs(query, "session_key"))
             if path == "/v2/pull":
                 return {"messages": hub.pull2(_qs(query, "machine"), _parse_wait(_qs(query, "wait")))}
             if path in ("/v2/status", "/v2/message"):
@@ -1008,6 +1282,13 @@ class Handler(BaseHTTPRequestHandler):
         body = self._read_body()
         self._msg_id = body.get("msg_id") if isinstance(body.get("msg_id"), str) else None
         self._client_msg_id = body.get("client_msg_id") if isinstance(body.get("client_msg_id"), str) else None
+        self._control_id = body.get("control_id") if isinstance(body.get("control_id"), str) else None
+        if path == "/v2/control/submit":
+            return hub.control_submit2(body)
+        if path == "/v2/control/begin":
+            return hub.control_begin2(body)
+        if path == "/v2/control/report":
+            return hub.control_report2(body)
         if path == "/v2/send":
             return hub.send2(body)
         if path == "/v2/report":

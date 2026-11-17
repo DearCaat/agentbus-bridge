@@ -27,9 +27,12 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 
 SERVER_NAME = "agentbus"
-SERVER_VERSION = "0.3.1"
+SERVER_VERSION = "0.4.0"
+RUNTIME_ID = uuid.uuid4().hex
+RELOAD_GENERATION = os.environ.get('AGENTBUS_RELOAD_GENERATION')
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 MAX_TEXT_BYTES = 64 * 1024
 NODE_TIMEOUT = 10.0
@@ -423,6 +426,28 @@ def tool_history(sess, args):
     return _message_op(sess, args, "history2", paged=True)
 
 
+def tool_control(sess, args):
+    reg = require_registered(sess)
+    req = {k:_str_arg(args,k) for k in ('to','action','scope','request_id')}
+    req.update(op='control_submit2',session_key=reg['session_key'])
+    reply = node_call(req)
+    if not reply.get('ok'):
+        raise ToolError(reply.get('error','control_failed'))
+    return {k:v for k,v in reply.items() if k!='ok'}
+
+
+def tool_control_status(sess, args):
+    if ('control_id' in args)==('request_id' in args):
+        raise ToolError('invalid_arguments: provide exactly one control_id or request_id')
+    key = 'control_id' if 'control_id' in args else 'request_id'
+    req = {key:_str_arg(args,key), 'op':'control_status2',
+           'session_key':require_registered(sess)['session_key']}
+    reply = node_call(req)
+    if not reply.get('ok'):
+        raise ToolError(reply.get('error','control_status_failed'))
+    return {k:v for k,v in reply.items() if k!='ok'}
+
+
 def tool_rename(sess, args):
     name = _str_arg(args, "name")
     if not NAME_RE.match(name):
@@ -441,6 +466,16 @@ def tool_rename(sess, args):
 SCHEMA_EMPTY = {"type": "object", "properties": {}, "additionalProperties": False}
 
 TOOLS = {
+    'agentbus_control': (tool_control, {
+        'description': 'Request a native reload with a stable request_id. This is a control action, not a text message. Codex reload_mcp requires explicit server scope and refreshes loaded threads on that same app server; verification identifies the exact target thread. Existing Claude interactive sessions do not expose native reload_plugins and return unsupported without execution. Hub acceptance is not native execution; query the control result after a disconnected or reloaded MCP call.',
+        'inputSchema': {'type':'object','properties':{
+            'to':{'type':'string'},'action':{'type':'string','enum':['reload_plugins','reload_mcp']},
+            'scope':{'type':'string','enum':['session','server']},'request_id':{'type':'string','minLength':1,'maxLength':200}},
+            'required':['to','action','scope','request_id'],'additionalProperties':False}}),
+    'agentbus_control_status': (tool_control_status, {
+        'description': 'Query a native control by exactly one control_id or original request_id. Accepted, executing, verified, applied_unverified, unsupported, failed and in_doubt are distinct. Retry transport failures using the same request_id, never a new ID to blindly repeat an uncertain native operation.',
+        'inputSchema':{'type':'object','properties':{'control_id':{'type':'string'},'request_id':{'type':'string'}},
+            'oneOf':[{'required':['control_id']},{'required':['request_id']}],'additionalProperties':False}}),
     "agentbus_whoami": (tool_whoami, {
         "description": "Show this session's agentbus address, session key, and node status.",
         "inputSchema": SCHEMA_EMPTY}),
@@ -547,10 +582,13 @@ def handle_tools_call(sess, params):
 
     fn = TOOLS[name][0]
     try:
-        return tool_result(fn(sess, args), False)
+        value = fn(sess, args)
+        failed_control = (name == 'agentbus_control' and isinstance(value,dict) and
+                          value.get('state') in ('unsupported','failed','in_doubt','expired'))
+        return tool_result(value, failed_control)
     except ToolError as e:
         error = {"error": getattr(e, "code", str(e).split(":", 1)[0]), "summary": "agentbus error: %s" % e}
-        if name == "agentbus_send" and isinstance(args.get("request_id"), str):
+        if name in ("agentbus_send",'agentbus_control','agentbus_control_status') and isinstance(args.get("request_id"), str):
             error["request_id"] = args["request_id"]
         return tool_result(error, True)
     except Exception as e:  # noqa: BLE001 - report, do not kill the MCP
@@ -562,7 +600,8 @@ def handle_request(sess, method, params):
     if method == "initialize":
         return {
             "protocolVersion": params.get("protocolVersion") or DEFAULT_PROTOCOL_VERSION,
-            "capabilities": {"tools": {}},
+            "capabilities": {"tools": {}, "experimental": {"agentbus": {
+                "runtime_id": RUNTIME_ID, "reload_generation": RELOAD_GENERATION}}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         }
     if method == "tools/list":

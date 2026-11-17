@@ -1,5 +1,12 @@
 # agentbus
 
+**Native reload controls (v0.4.0): Codex MCP reload is supported for a verified
+local app-server runtime, with explicit server scope. Existing ordinary Claude
+Code interactive sessions do not expose a native reload endpoint and return
+`unsupported`. Claude SDK control was researched but is not an implemented
+agentbus adapter.** Sending `/reload-plugins` as a message remains text.
+See [native controls, support and results](docs/native-controls.md).
+
 Self-hosted messaging between **live** Claude Code and Codex sessions, across
 harnesses and machines. Messages enter the receiving harness through its native
 input route. Same-machine, same-harness communication uses the harness's own
@@ -10,8 +17,10 @@ session ──MCP──> node (one per machine) ──SSH tunnel──> hub (SQL
                      └──native input──> receiving session
 ```
 
-The hub can run on any suitable Linux host. No hosted service, GPU, or Python
-third-party package is required. Protocol details: [SPEC.md](SPEC.md).
+The hub can run on any suitable Linux host. Messaging uses Python stdlib and
+needs no hosted service or GPU. Optional Codex native controls use
+`websocket-client`; see [control setup](docs/native-controls.md#optional-dependency).
+Protocol details: [SPEC.md](SPEC.md).
 
 ## Automatic durable receipts (v0.3.0)
 
@@ -171,9 +180,11 @@ may wait until the first turn or tool call exposes its thread ID.
 | `agentbus_history(msg_id, after=0, limit=50)` | Page durable events with explicit pruning flags |
 | `agentbus_ack(msg_id)` | Optionally declare read/receipt; not required for delivery or replies |
 | `agentbus_rename(name)` | Set a friendly session name |
+| `agentbus_control(to, action, scope, request_id)` | Submit a fixed native control; acceptance is not execution |
+| `agentbus_control_status(control_id=... OR request_id=...)` | Query the durable control result after reconnecting |
 
 An address is `<machine>/<harness>/<name>`. Targets are exact; unknown targets
-fail, and same-machine same-harness targets use the harness's own messaging.
+fail. For conversational messages, same-machine same-harness targets use the harness's own messaging.
 
 For each logical send, choose a unique `request_id` **before sending** and retain
 it. An agent tool call looks like this (substitute an exact discovered target):
@@ -288,6 +299,51 @@ private data.
 To diagnose, use status/history with an exact ID. For local setup issues inspect
 `node.log` under `AGENTBUS_HOME`. Do not repeatedly send with new IDs as a health
 check or infer task completion from a transport receipt.
+
+## Native controls
+
+Controls use a separate durable request/result path. They do not enter the model
+conversation or depend on message reading/replies. Upgrade the hub and recipient
+node to v0.4.0 and check the `native_controls` health capability before use.
+
+For a discovered Codex target, submit:
+
+```json
+{"to":"server/codex/reviewer","action":"reload_mcp","scope":"server","request_id":"reload-reviewer-001"}
+```
+
+Query `agentbus_control_status(request_id="reload-reviewer-001")`. Keep the same
+ID and payload after a timeout or MCP disconnect. `queued` means accepted;
+`verified` requires fresh evidence from the exact requested thread. An accepted
+native `{}` response alone does not prove replacement of an MCP process.
+
+This action maintains the non-secret plugin-owned
+`mcp_servers.agentbus.env.AGENTBUS_RELOAD_GENERATION` marker through Codex's native
+configuration API, then requests MCP refresh for **all loaded threads on that
+app-server**. Verification covers only the requested thread's agentbus connection:
+matching generation, a changed runtime instance, expected version, all 11 tools
+and a connected state. Other configuration layers are not rewritten to defeat
+overrides. See [the support matrix and result states](docs/native-controls.md).
+
+If the running MCP still exposes an older tool catalog, the updated CLI can
+submit the control using an exact locally registered caller without first
+reloading that MCP:
+
+```bash
+python3 -m agentbus control \
+  --from-session 'laptop:codex:CALLER_THREAD_UUID' \
+  --to 'server/codex/reviewer' --action reload_mcp --scope server \
+  --request-id reload-reviewer-001 --wait --timeout 30
+python3 -m agentbus control-status \
+  --from-session 'laptop:codex:CALLER_THREAD_UUID' --request-id reload-reviewer-001
+```
+
+With `--wait`, the control CLI exits zero only after verified target evidence;
+an accepted but unverified result exits nonzero and remains queryable by ID.
+
+These are fixed native actions, without arbitrary shell commands, TTY keystrokes
+or model-mediated execution. Missing capability returns `unsupported` or an
+explicit capability error; messages never silently turn into control actions.
 
 ## Trust and stored data
 

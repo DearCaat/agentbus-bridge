@@ -396,6 +396,8 @@ class Node:
         self._log_lock = threading.Lock()
         self._reliable = None
         self._reliable_lock = threading.Lock()
+        self._control = None
+        self._control_lock = threading.Lock()
 
     # ----- lifecycle -------------------------------------------------------
 
@@ -428,6 +430,7 @@ class Node:
             self.flush_reports()
             self._spawn(self._heartbeat_loop)
             self._spawn(self._pull_loop)
+            self._spawn(self._control_loop)
         except BaseException:
             self.stop()
             raise
@@ -582,6 +585,8 @@ class Node:
     def dispatch(self, req, peer_pid=0):
         if not isinstance(req, dict):
             return _fail("bad_request", "request must be a JSON object")
+        if req.get('op') in ('control_submit2','control_status2'):
+            return self.controller().dispatch(req)
         if req.get('op') in ('send2', 'status2', 'ack2', 'message2', 'inbox2', 'history2'):
             return self.reliable().dispatch(req, peer_pid)
         handlers = {
@@ -595,6 +600,21 @@ class Node:
         if handler is None:
             return _fail("unknown_op", str(req.get("op")))
         return handler(req, peer_pid)
+
+    def controller(self):
+        with self._control_lock:
+            if self._control is None:
+                from .control import Controller
+                self._control = Controller(self)
+            return self._control
+
+    def _control_loop(self):
+        while not self._stop.is_set():
+            try:
+                self.controller().cycle()
+            except Exception as exc:
+                self._log('native control cycle interrupted: %s' % type(exc).__name__)
+            self._stop.wait(1)
 
     def _session_key(self, req):
         key = req.get("session_key")

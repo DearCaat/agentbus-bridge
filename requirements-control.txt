@@ -1,0 +1,2 @@
+# Optional: messaging and node receipt delivery remain Python stdlib-only.
+websocket-client>=1.9,<2

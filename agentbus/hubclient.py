@@ -109,6 +109,21 @@ class HubClient:
         return self._call("GET", "/v1/status", query={"msg_id": msg_id})
 
     # Reliability protocol 2 never silently downgrades to v1.
+    def control_submit2(self, body):
+        return self._call('POST', '/v2/control/submit', body=body)
+
+    def control_pull2(self, machine, owner):
+        return self._call('GET', '/v2/control/pull', query={'machine':machine,'owner':owner})
+
+    def control_begin2(self, body):
+        return self._call('POST', '/v2/control/begin', body=body)
+
+    def control_report2(self, body):
+        return self._call('POST', '/v2/control/report', body=body)
+
+    def control_status2(self, control_id, session_key):
+        return self._call('GET', '/v2/control/status', query={'control_id':control_id,'session_key':session_key})
+
     def send2(self, body):
         return self._call('POST', '/v2/send', body=body)
 
