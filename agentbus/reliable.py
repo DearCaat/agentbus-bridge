@@ -329,7 +329,7 @@ class Reliable:
             return
         self.recover_at = time.monotonic() + 5
         with self.receive_lock:
-            for row in self._rows("SELECT * FROM incoming2 WHERE envelope IS NULL AND body_pruned=0 AND state!='acknowledged' ORDER BY updated_at LIMIT 64"):
+            for row in self._rows("SELECT * FROM incoming2 WHERE envelope IS NULL AND body_pruned=0 ORDER BY updated_at LIMIT 64"):
                 try:
                     message = self.node.hub.message2(row['msg_id'],row['to_key'])
                     if message.get('text') is not None:

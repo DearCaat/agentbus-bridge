@@ -14,13 +14,13 @@ the same. `agentbus_ack` remains an optional explicit read/receipt declaration.
    including WAL transactions. Back up each node database consistently too:
    local full envelopes/outbox entries are recovery data, not disposable caches.
    Use new private backup destinations; do not overwrite old copies.
-3. Pin `v0.3.0` in a separate code directory. Smoke-test a temporary Hub, DB,
+3. Pin `v0.3.1` in a separate code directory. Smoke-test a temporary Hub, DB,
    token and local port with fake recipients; never send test traffic to active
    sessions. Health must advertise `durable_receipts` as well as protocol 2.
 4. Upgrade only the Hub through its existing supervisor, retaining the same
    DB/token/port and private rotating `--log-file`. Existing ACK timestamps seed
    durable receipt timestamps; no new model reading declaration is fabricated.
-5. Check actual `/v1/health`: version `0.3.0`, `protocols: [1, 2]` and
+5. Check actual `/v1/health`: version `0.3.1`, `protocols: [1, 2]` and
    `capabilities` containing `durable_receipts`. Verify startup/access JSON logs
    and private DB/log permissions before enabling new nodes.
 

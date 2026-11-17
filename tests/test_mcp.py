@@ -208,7 +208,7 @@ class TestProtocol(McpTestBase):
                                     "clientInfo": {"name": "t", "version": "0"}})
         res = msg["result"]
         self.assertEqual(res["protocolVersion"], "2025-06-18")
-        self.assertEqual(res["serverInfo"], {"name": "agentbus", "version": "0.3.0"})
+        self.assertEqual(res["serverInfo"], {"name": "agentbus", "version": "0.3.1"})
         self.assertIn("tools", res["capabilities"])
 
     def test_tools_list_has_nine_tools_with_schemas(self):

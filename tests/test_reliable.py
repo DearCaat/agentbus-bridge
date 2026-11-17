@@ -188,6 +188,21 @@ class ReliabilityTests(unittest.TestCase):
         reliable.handle(self.hub.pull2('target',0)[0])
         self.assertEqual(self.observed,[second['msg_id']])
 
+    def test_legacy_read_during_rolling_upgrade_also_gets_durable_receipt(self):
+        first=self.send()
+        second=self.send('later','next')
+        message=self.hub.pull2('target',0)[0]
+        r=self.receiver.reliable()
+        self.receiver.store._exec("INSERT INTO incoming2(msg_id,from_key,to_key,seq,state,detail,attempt,updated_at) VALUES (?,?,?,?,'acknowledged',NULL,?,1)",(message['msg_id'],message['from_key'],message['to_key'],message['seq'],message['attempt']))
+        self.hub.report2(dict(msg_id=first['msg_id'],attempt=message['attempt'],state='injected'))
+        self.hub.ack2(dict(msg_id=first['msg_id'],session_key=self.b['session_key']))
+        self.assertFalse(self.hub.status2(first['msg_id'],self.a['session_key'])['receiver_persisted'])
+        r.recover(force=True)
+        self.assertEqual(self.observed,[])
+        self.assertTrue(self.hub.status2(first['msg_id'],self.a['session_key'])['receiver_persisted'])
+        r.handle(self.hub.pull2('target',0)[0])
+        self.assertEqual(self.observed,[second['msg_id']])
+
     def test_optional_read_does_not_erase_uncertain_native_injection(self):
         first=self.send()
         second=self.send('later','next')
