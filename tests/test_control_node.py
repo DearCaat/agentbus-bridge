@@ -94,6 +94,76 @@ class ControlNodeTests(unittest.TestCase):
         self.assertEqual(len(self.calls),1)
         self.assertEqual(self.submit(scope='session')['error'],'idempotency_conflict')
 
+    def test_never_accepted_control_does_not_execute_hours_after_network_recovery(self):
+        with patch.object(self.sender.hub,'control_submit2',side_effect=HubError(0,'unreachable')):
+            first=self.submit()
+        self.assertEqual(first['state'],'submission_unconfirmed')
+        self.assertFalse(first['retry_stopped'])
+        deadline=first['retry_until']
+        with patch('agentbus.control.time.time',return_value=deadline+7200):
+            self.sender.controller().cycle()
+            # Explicit retry and controller restart cannot reopen the window.
+            again=self.submit()
+            from agentbus.control import Controller
+            recovered=Controller(self.sender)
+            recovered.flush()
+            self.receiver.controller().cycle()
+        self.assertEqual(again['retry_until'],deadline)
+        self.assertTrue(again['retry_stopped'])
+        self.assertEqual(again['state'],'submission_unconfirmed')
+        self.assertIsNone(again['execution_confirmed'])
+        self.assertEqual(self.hub.conn.execute('SELECT count(*) FROM control_jobs').fetchone()[0],0)
+        self.assertEqual(self.calls,[])
+
+    def test_lost_accepted_response_after_retry_deadline_is_still_unknown(self):
+        self.sender.hub.lose_submit=True
+        first=self.submit()
+        self.receiver.controller().cycle()
+        with patch('agentbus.control.time.time',return_value=first['retry_until']+1):
+            self.sender.controller().flush()
+            result=self.status()
+        self.assertEqual(result['state'],'submission_unconfirmed')
+        self.assertTrue(result['retry_stopped'])
+        self.assertIsNone(result['execution_confirmed'])
+        self.assertEqual(len(self.calls),1)
+        self.assertEqual(self.hub.conn.execute('SELECT count(*) FROM control_jobs').fetchone()[0],1)
+
+    def test_known_control_id_remains_queryable_after_submission_deadline(self):
+        first=self.submit()
+        row=self.sender.controller().row('SELECT * FROM control_outbox')
+        self.receiver.controller().cycle()
+        with patch('agentbus.control.time.time',return_value=row['retry_until']+1):
+            result=self.status()
+        self.assertEqual(result['control_id'],first['control_id'])
+        self.assertEqual(result['state'],'verified')
+
+    def test_observed_retry_stop_survives_clock_rollback_and_restart(self):
+        with patch.object(self.sender.hub,'control_submit2',side_effect=HubError(0,'unreachable')):
+            first=self.submit()
+        with patch('agentbus.control.time.time',return_value=first['retry_until']+1):
+            self.assertTrue(self.status()['retry_stopped'])
+        from agentbus.control import Controller
+        recovered=Controller(self.sender)
+        with patch('agentbus.control.time.time',return_value=first['retry_until']-200):
+            recovered.flush()
+            again=recovered.status(self.a['session_key'],{'request_id':'reload-1'})
+        self.assertTrue(again['retry_stopped'])
+        self.assertEqual(self.hub.conn.execute('SELECT count(*) FROM control_jobs').fetchone()[0],0)
+
+    def test_legacy_pending_migration_does_not_grant_new_retry_window(self):
+        with patch.object(self.sender.hub,'control_submit2',side_effect=HubError(0,'unreachable')):
+            self.submit()
+        db=self.sender.store._db
+        db.execute('ALTER TABLE control_outbox DROP COLUMN retry_until');db.commit()
+        from agentbus.control import Controller
+        recovered=Controller(self.sender)
+        recovered.flush()
+        result=recovered.status(self.a['session_key'],{'request_id':'reload-1'})
+        self.assertTrue(result['retry_stopped'])
+        self.assertEqual(result['retry_until'],0)
+        self.assertIsNone(result['execution_confirmed'])
+        self.assertEqual(self.hub.conn.execute('SELECT count(*) FROM control_jobs').fetchone()[0],0)
+
     def test_session_scope_does_not_silently_reload_shared_server(self):
         self.submit(scope='session');self.receiver.controller().cycle()
         self.assertEqual(self.status()['state'],'unsupported');self.assertEqual(self.calls,[])

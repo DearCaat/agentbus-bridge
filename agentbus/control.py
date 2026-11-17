@@ -15,6 +15,8 @@ DDL = '''
 CREATE TABLE IF NOT EXISTS control_outbox (
  from_key TEXT NOT NULL, request_id TEXT NOT NULL, target TEXT NOT NULL,
  payload TEXT NOT NULL, fingerprint TEXT NOT NULL, response TEXT, error TEXT,
+ retry_until REAL NOT NULL DEFAULT 0,
+ retry_stopped INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(from_key,request_id)
 );
 CREATE TABLE IF NOT EXISTS control_journal (
@@ -23,6 +25,7 @@ CREATE TABLE IF NOT EXISTS control_journal (
 );
 '''
 ACTIONS = ('reload_plugins', 'reload_mcp')
+SUBMISSION_RETRY_SECONDS = 300
 TERMINAL = ('verified', 'applied_unverified', 'unsupported', 'failed', 'in_doubt', 'expired')
 
 
@@ -96,6 +99,14 @@ class Controller:
         self.supported = False
         with self.store._lock:
             self.store._db.executescript(DDL)
+            columns = {r[1] for r in self.store._db.execute('PRAGMA table_info(control_outbox)')}
+            if 'retry_until' not in columns:
+                # An old pending request has no reliable creation time. Do not
+                # silently grant it a new execution opportunity on upgrade.
+                self.store._db.execute('ALTER TABLE control_outbox ADD COLUMN retry_until REAL NOT NULL DEFAULT 0')
+            if 'retry_stopped' not in columns:
+                self.store._db.execute('ALTER TABLE control_outbox ADD COLUMN retry_stopped INTEGER NOT NULL DEFAULT 0')
+            self.store._db.commit()
         try:
             restore_transport(node)
         except (OSError,ValueError,zipfile.BadZipFile):
@@ -152,16 +163,30 @@ class Controller:
             raise ValueError('Exact registered target was not found; no native action was queued.')
         body = dict(from_key=key, to=canonical, request_id=rid, action=action, scope=scope)
         fingerprint = hashlib.sha256(encoded(body).encode()).hexdigest()
-        self.store._exec('INSERT OR IGNORE INTO control_outbox(from_key,request_id,target,payload,fingerprint) VALUES (?,?,?,?,?)',
-                         (key,rid,target,encoded(body),fingerprint))
+        self.store._exec('INSERT OR IGNORE INTO control_outbox(from_key,request_id,target,payload,fingerprint,retry_until) VALUES (?,?,?,?,?,?)',
+                         (key,rid,target,encoded(body),fingerprint,time.time()+SUBMISSION_RETRY_SECONDS))
         saved = self.row('SELECT * FROM control_outbox WHERE from_key=? AND request_id=?', (key,rid))
         if saved['fingerprint'] != fingerprint:
             return {'ok': False, 'error': 'idempotency_conflict', 'request_id': rid}
         self.flush()
         return self.status(key, {'request_id': rid})
 
+    def submission_stopped(self, row):
+        # Persist an observed stop, including across clock correction/restart.
+        latest = self.row('SELECT retry_stopped FROM control_outbox WHERE from_key=? AND request_id=?',
+                          (row['from_key'],row['request_id']))
+        if latest['retry_stopped']:
+            return True
+        if time.time() >= row['retry_until']:
+            self.store._exec('UPDATE control_outbox SET retry_stopped=1 WHERE from_key=? AND request_id=?',
+                             (row['from_key'],row['request_id']))
+            return True
+        return False
+
     def flush(self):
         for row in self.rows('SELECT * FROM control_outbox WHERE response IS NULL'):
+            if self.submission_stopped(row):
+                continue
             try:
                 reply = self.node.hub.control_submit2(json.loads(row['payload']))
                 self.store._exec('UPDATE control_outbox SET response=?,error=NULL WHERE from_key=? AND request_id=?',
@@ -179,9 +204,12 @@ class Controller:
             if row is None:
                 return dict(ok=True,request_id=rid,state='unknown',execution_confirmed=None,verification_confirmed=None)
             if not row['response']:
+                stopped = self.submission_stopped(row)
                 return dict(ok=True,request_id=rid,state='submission_unconfirmed',error=row['error'],
+                            retry_until=row['retry_until'],retry_stopped=stopped,
                             execution_confirmed=None,verification_confirmed=None,
-                            summary='Persisted locally; hub acceptance and native execution are unknown. Retry with the SAME request_id.')
+                            summary=('Submission retry window ended; no further submission attempts will be made for this request_id. Hub acceptance and native execution remain unknown; do not assume no action ran or create another request to resolve this uncertainty.' if stopped else
+                                     'Persisted locally; hub acceptance and native execution are unknown. Retry with the SAME request_id before its submission retry deadline.'))
             cached = json.loads(row['response'])
             cid = cached['control_id']
         try:

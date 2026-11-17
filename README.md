@@ -1,11 +1,13 @@
 # agentbus
 
-**Native reload controls (v0.4.0): Codex MCP reload is supported for a verified
+**Native reload controls (v0.4.1): Codex MCP reload is supported for a verified
 local app-server runtime, with explicit server scope. Existing ordinary Claude
 Code interactive sessions do not expose a native reload endpoint and return
 `unsupported`. Claude SDK control was researched but is not an implemented
 agentbus adapter.** Sending `/reload-plugins` as a message remains text.
 See [native controls, support and results](docs/native-controls.md).
+Unconfirmed control submissions stop retrying five minutes after local creation;
+they cannot silently start a first submission hours after network recovery.
 
 Self-hosted messaging between **live** Claude Code and Codex sessions, across
 harnesses and machines. Messages enter the receiving harness through its native

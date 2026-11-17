@@ -1,4 +1,4 @@
-# Native controls (v0.4.0)
+# Native controls (v0.4.1)
 
 **Existing ordinary Claude Code interactive sessions are unsupported for native
 remote plugin reload.** Their messaging socket intentionally skips slash
@@ -194,7 +194,26 @@ retains/reports a journaled result or marks interrupted execution `in_doubt`.
 Controls with no result should be investigated by ID, not blindly resubmitted with
 a new ID.
 
-Queued jobs expire after five minutes without execution. Terminal detailed
+Starting in v0.4.1, a locally unconfirmed submission has a persisted five-minute
+submission retry window. Each new submission attempt checks that deadline;
+reusing the same request ID or restarting the node never renews it. Once a stop
+is observed, it remains stopped even if the system clock moves backward. Pending
+requests from older nodes have no known local creation deadline and stop retrying
+on upgrade. Already-known control IDs remain queryable, and recipient result
+reporting continues normally. This fix is compatible with the v0.4.0 hub.
+
+After the retry window, status stays `submission_unconfirmed` with
+`retry_stopped=true` and unknown execution/verification fields. The hub may have
+accepted an earlier attempt whose reply was lost; stopped retries do not mean
+that no action ran. Do not allocate another request ID to resolve that uncertainty.
+The local deadline stops new submission attempts; it cannot cancel an in-flight
+request or a job the hub already accepted. Investigate the original request ID
+and participant identities in the hub's control history when no control ID was
+returned.
+
+Hub queued jobs expire five minutes after hub acceptance without execution;
+this is a separate deadline, not a five-minute end-to-end execution guarantee.
+Terminal detailed
 results/events age out after 30 days, with identity/fingerprint/state tombstones
 and explicit pruning metadata retained. This logical cleanup does not promise
 physical file shrinking or erase private backups.
