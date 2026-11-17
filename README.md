@@ -13,18 +13,21 @@ session ──MCP──> node (one per machine) ──SSH tunnel──> hub (SQL
 The hub can run on any suitable Linux host. No hosted service, GPU, or Python
 third-party package is required. Protocol details: [SPEC.md](SPEC.md).
 
-## Reliability protocol 2 (v0.2.0)
+## Automatic durable receipts (v0.3.0)
 
-Upgrade the hub to v0.2.0 **before** enabling these clients. Verify that
-`GET /v1/health` reports `protocols: [1, 2]`. A new client refuses reliable
-operations on an old hub; it never silently sends through the old protocol.
-See [the upgrade procedure](docs/upgrade-v0.2.md).
+Upgrade the hub to v0.3.0 **before** enabling these clients. Verify that
+`GET /v1/health` reports `protocols: [1, 2]` and the `durable_receipts` capability.
+New nodes refuse reliable operations without that capability; they never silently
+fall back. See [the v0.3 upgrade procedure](docs/upgrade-v0.3.md).
 
-Like Matrix transaction IDs and reply relations, each send has a stable caller
-request ID and each reply names its parent message. Like publisher confirms and
-consumer acknowledgements in message brokers, hub acceptance and recipient ACK
-are separate facts. Native injection does not prove understanding or task
-completion. Design sources: [Matrix client/server specification](https://spec.matrix.org/latest/client-server-api/#transaction-identifiers),
+The recipient plugin automatically confirms transport receipt **after reliably
+saving the complete message locally**. Reading or replying never requires a
+manual ACK, and unread messages do not block later messages. Durable storage,
+native input submission, model reading and task completion remain separate facts.
+`agentbus_ack` is an optional explicit read/receipt declaration.
+
+Stable caller request IDs and exact reply parents retain their existing
+semantics. Design sources: [Matrix transaction identifiers](https://spec.matrix.org/latest/client-server-api/#transaction-identifiers),
 [Matrix replies](https://spec.matrix.org/latest/client-server-api/#rich-replies),
 [RabbitMQ confirmations](https://www.rabbitmq.com/docs/confirms).
 
@@ -163,10 +166,10 @@ may wait until the first turn or tool call exposes its thread ID.
 | `agentbus_peers()` | Registered peers and online status |
 | `agentbus_send(to, text, request_id, reply_to?)` | Persist one logical send; exact parent for replies |
 | `agentbus_status(msg_id=... OR request_id=...)` | Observe status; provide exactly one identifier |
-| `agentbus_message(msg_id)` | Retrieve retained full content or an explicit blocked/pruned result |
-| `agentbus_inbox(after=0, limit=50)` | Page received messages; later blocked content is withheld |
+| `agentbus_message(msg_id)` | Retrieve retained full content and native presentation/pruning metadata |
+| `agentbus_inbox(after=0, limit=50)` | Page complete retained messages, independent of unread predecessors |
 | `agentbus_history(msg_id, after=0, limit=50)` | Page durable events with explicit pruning flags |
-| `agentbus_ack(msg_id)` | Explicitly declare receipt after reading this message |
+| `agentbus_ack(msg_id)` | Optionally declare read/receipt; not required for delivery or replies |
 | `agentbus_rename(name)` | Set a friendly session name |
 
 An address is `<machine>/<harness>/<name>`. Targets are exact; unknown targets
@@ -191,50 +194,56 @@ message, assigns its stable `msg_id`, and returns its stream `seq`, exact peers,
 A locally persisted but unconfirmed send says `pending`; connectivity failure
 must not be interpreted as definite non-delivery.
 
-On receiving a full message, read it and explicitly call `agentbus_ack(msg_id)`.
-Fetching content does not automatically ACK. Reply using a new stable request ID
-and `reply_to` equal to the received `msg_id`; the parent must belong to the same
-pair of peers in the opposite direction. Replies carry their exact association,
-not a guess based on arrival time. Task/review completion must be stated and
-bound to the relevant task/revision by the participating agents.
+The recipient node validates the full message hash and byte length, commits the
+immutable envelope to local SQLite with full synchronization, then automatically
+confirms storage to the hub. Missing confirmation responses are retried using the
+same identity. The sender sees `receiver_persisted=true` only after that durable
+receipt; it does **not** mean that the model read the message.
+
+Use a new stable request ID for a reply and set `reply_to` to the exact received
+`msg_id`. The parent must belong to the same pair of peers in the opposite
+direction. No read declaration is needed. `agentbus_ack(msg_id)` remains available
+for an optional explicit declaration; it never holds later messages. Participants
+must state business/task completion separately and bind it to the relevant task
+or revision.
 
 ### Order and uncertainty
 
 Order is per `(sending session, receiving session)`, using persisted sequence
-numbers, not wall-clock timestamps. Concurrent independent streams have no
-promised global order. A later message stays blocked until the preceding message
-has an explicit recipient ACK; this also applies to `message` and `inbox`, which
-withhold later text. Other directional streams continue independently.
+numbers, not wall-clock timestamps. Independent streams have no global order.
+The next transport message becomes eligible after the preceding envelope has
+been reliably saved by the recipient plugin. Native input follows this sequence
+without waiting for model reading, an optional declaration or an ordinary reply.
 
-| State | Evidence |
+| Field / state | Evidence |
 | --- | --- |
-| `pending` (local) | Stored by sender; hub acceptance unconfirmed |
-| `queued` | Hub accepted; awaiting recipient-side delivery |
-| `leased` | A node claimed an attempt; receipt unconfirmed |
-| `injected` | Native input route accepted; agent has not acknowledged |
-| `acknowledged` | Recipient agent explicitly declared receipt; task completion unknown |
-| `failed` / `expired` | Attempt failed or queue expired; the stream remains blocked |
-| `in_doubt` | Injection may have occurred; do not blindly resend |
+| `submission=pending` / `unconfirmed` | Sender saved the request; hub acceptance is unconfirmed |
+| `submission=accepted` | Hub stored the message |
+| `receiver_persisted=true`, `received_at` | Recipient plugin committed the complete envelope locally |
+| `injection_state=injected`, `injected_at` | Native input route accepted the message; model reading is unknown |
+| `receiver_acknowledged=true` | Optional explicit read/receipt declaration, not proof of understanding |
+| `agent_read` | Explicit declaration metadata, if any; automatic storage never manufactures it |
+| `injection_state=failed` / `in_doubt` | Native input failed or may have occurred; inspect retained inbox |
+| `blocked_by_delivery` | An earlier native presentation outcome prevents safely injecting this message |
 | `unknown_or_pruned` | No retained record; cannot conclude never sent or not received |
 
-A missing ACK, failed injection or expired head is a visible block, not permission
-to skip it. A recipient can query its inbox, retrieve the head's retained content,
-and acknowledge it explicitly. An ACK is a recipient declaration, not proof of
-understanding. Socket/CLI timeouts and a crash during injection remain uncertain;
-existing node dedup records prevent blind reinjection. Delayed reports from an
-old lease cannot overwrite a newer attempt or recipient ACK.
+Socket/CLI timeouts and a crash during injection can remain uncertain. Nodes do
+not blindly reinject an uncertain message or skip it in native presentation. This
+can block later **native input**, but all retained text stays available through
+`agentbus_message` and `agentbus_inbox`; unread predecessors never hide it. An
+optional read declaration does not convert uncertainty into successful injection.
 
-Every delivered envelope includes ID, sender/recipient, sequence, reply parent,
-ordering scope and exact ACK instructions, followed by the entire message text.
-UTF-8 byte length and SHA-256 are verified before native injection. Pagination
-uses explicit cursors and `has_more`; inspect `content_visible`, `body_retained`
-and `history_pruned` rather than interpreting missing content as an empty reply.
-Cached sender status is labeled stale and its current ACK field is unknown.
+Every v2 envelope includes the full message, ID, sender/recipient, sequence,
+reply parent, ordering scope and optional declaration instructions. UTF-8 byte
+length and SHA-256 are checked before storage and native injection. Pagination
+uses explicit cursors and `has_more`; inspect `body_retained`, `history_pruned`,
+`injection_state` and `blocked_by_delivery`. Cached status explicitly marks current
+receipt knowledge as unknown rather than a definite negative.
 
-Legacy `/v1` traffic stays isolated for migration and retains its old weaker
-semantics (`delivered` only meant native input submission). Old live MCP processes
-keep that interface until reloaded; installing new files alone does not upgrade
-an already-running session.
+Legacy `/v1` traffic remains isolated for migration, with its old weaker semantics
+(`delivered` meant native input submission). Already-loaded MCP processes can
+retain old tool descriptions until reloaded; the upgraded node performs automatic
+durable receipts regardless. Reload them to see the current optional-ACK wording.
 
 ### Durable history and cleanup
 
@@ -256,21 +265,25 @@ flushes each record; storage errors are reported on stderr.
 
 The running hub checks cleanup every 30 seconds, including when idle:
 
-- ACKed message bodies: retained for 7 days by default.
-- ACKed event history: retained for 30 days by default.
+- Eligible message bodies: retained for 7 days by default.
+- Eligible event history: retained for 30 days by default.
 - Override with `--body-retention-days` and `--event-retention-days` (positive days).
-- Active, uncertain, failed and unacknowledged heads are not pruned by this job.
+- Eligibility requires an explicit declaration, or durable recipient storage plus
+  successful native injection. Failed/uncertain presentation recovery copies are
+  preserved; unread messages that were safely stored and injected can age out.
 - Minimal IDs, fingerprints, stream counters and state tombstones remain for
   deduplication and honest status lookup; these small indexes continue to grow.
 - Pruned bodies/history are explicitly marked. Cleanup never manufactures an ACK,
-  skips a head, or resets a sequence number. Legacy data is preserved unchanged.
+  invents reading, or resets a sequence number. Legacy v1 data is preserved unchanged.
 
-Node operational logs rotate at 5 MiB with three retained archives. Accepted
-outbox text is cleared only after its recipient ACK and authoritative Hub body
-pruning have been confirmed, at least 7 days after local creation; its identity,
-fingerprint, sequence and receipt remain. Unconfirmed outbox text is kept. Hub body/event cleanup is logical
-SQLite deletion: freed pages are reused; it is not a promise to shrink the DB
-file or securely erase disk backups. Protect database backups as private data.
+Node operational logs rotate at 5 MiB with three retained archives. The recipient
+node keeps the full immutable envelope for recovery and retries pending durable
+receipts after restart. Accepted sender outbox bodies become eligible for cleanup
+only after authoritative safe retention/pruning conditions are confirmed;
+unconfirmed send bodies remain. Identity, fingerprint, sequence and receipt
+metadata remain for deduplication. SQLite cleanup reuses freed pages; it is not a
+promise to shrink files or securely erase backups. Protect database backups as
+private data.
 
 To diagnose, use status/history with an exact ID. For local setup issues inspect
 `node.log` under `AGENTBUS_HOME`. Do not repeatedly send with new IDs as a health
@@ -284,7 +297,8 @@ not provide separate user or machine authorization. Run separate hubs for groups
 that should not share that access.
 
 The hub stores message text and session metadata in SQLite. The local node stores
-session delivery information, including a Claude messaging token when supplied.
+complete received message envelopes, sender outbox data and session delivery
+information, including a Claude messaging token when supplied.
 Protect runtime directories and database backups as private data. The hub binds
 only to loopback; cross-machine traffic travels through SSH. No credentials or
 real deployment configuration are included in the plugin.

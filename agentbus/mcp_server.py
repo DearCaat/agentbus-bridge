@@ -29,7 +29,7 @@ import time
 import traceback
 
 SERVER_NAME = "agentbus"
-SERVER_VERSION = "0.2.1"
+SERVER_VERSION = "0.3.0"
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 MAX_TEXT_BYTES = 64 * 1024
 NODE_TIMEOUT = 10.0
@@ -323,26 +323,34 @@ def _receipt(resp, operation, request_id=None):
     if request_id is not None:
         result["request_id"] = request_id
     if not result.get("summary"):
-        if result.get("receiver_acknowledged"):
-            summary = "Recipient explicitly acknowledged receipt; this does not confirm task completion."
-        elif result.get("state") == "unknown_or_pruned":
+        if result.get("state") == "unknown_or_pruned":
             summary = "Unknown or pruned message; this does not prove it was never sent or received."
+        elif result.get("receiver_persisted"):
+            summary = "Recipient plugin durably saved the message; model reading and task completion remain unknown."
+            if result.get("injection_state") in ("in_doubt", "failed"):
+                summary += " Native injection is uncertain or failed; the retained inbox remains available."
+            if result.get("blocked_by_delivery"):
+                summary += " Native presentation is blocked by an earlier injection outcome, not by unread messages."
+            if result.get("receiver_acknowledged"):
+                summary += " Recipient also made an optional explicit read/receipt declaration."
+        elif result.get("receiver_acknowledged"):
+            summary = "Recipient explicitly declared read/receipt; this does not confirm understanding or task completion."
         elif operation == "send2":
-            summary = ("Hub accepted the message; recipient receipt remains unconfirmed."
+            summary = ("Hub accepted the message; recipient plugin persistence remains unconfirmed; model reading is unknown."
                        if result.get("submission") == "accepted" else
                        "Submission pending or unknown; retry only with the same request_id and payload.")
         elif result.get("state") in ("unknown", "in_doubt", "injecting"):
-            summary = "Outcome remains unknown or uncertain; receipt is unconfirmed. Do not infer no delivery."
+            summary = "Transport or native injection outcome remains uncertain; model reading is unknown. Do not infer no delivery."
         elif operation == "ack2":
-            summary = "Acknowledgement outcome is unconfirmed; inspect message status."
+            summary = "Optional read/receipt declaration is unconfirmed; later delivery never requires this tool."
         elif operation == "message2" and result.get("body_retained") is False:
-            summary = "Message body is not retained; metadata retrieval does not acknowledge receipt."
+            summary = "Message body is not retained; metadata retrieval is not a read declaration."
         elif operation in ("message2", "inbox2"):
-            summary = "Retrieved available message data; retrieval does not acknowledge receipt."
+            summary = "Retrieved retained message data, independent of earlier unread messages; no read declaration was made."
         elif operation == "history2":
             summary = "Retrieved available history; inspect pagination and pruning fields."
         else:
-            summary = "Observed transport status; recipient receipt and task completion are separate."
+            summary = "Observed transport/native injection status; model reading and task completion remain unknown."
         result["summary"] = summary
     return result
 
@@ -447,7 +455,9 @@ TOOLS = {
                        "(same_machine_same_harness); use the harness's own messaging for it (Claude Code: "
                        "ListAgents to find the session, SendMessage to message it). Requires a stable caller-generated request_id; "
                        "retry with the SAME ID and identical payload after uncertainty. reply_to associates a reply "
-                       "with the exact received msg_id. Hub acceptance is not recipient ACK or task completion.",
+                       "with the exact received msg_id. The recipient plugin automatically confirms durable storage; "
+                       "manual ACK is optional. Hub acceptance, recipient persistence, native injection, model reading "
+                       "and task completion are separate facts.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -458,8 +468,9 @@ TOOLS = {
             },
             "required": ["to", "text", "request_id"], "additionalProperties": False}}),
     "agentbus_status": (tool_status, {
-        "description": "Observe message transport and explicit recipient ACK state by msg_id OR request_id. "
-                       "Unknown is not proof of no delivery; ACK does not mean task completion.",
+        "description": "Observe hub submission, receiver_persisted, injection_state and optional explicit read declaration "
+                       "by msg_id OR request_id. Durable plugin storage and native injection do not prove model reading "
+                       "or task completion. Unknown is not proof of no delivery.",
         "inputSchema": {"type": "object", "properties": {
             "msg_id": {"type": "string", "minLength": 1},
             "request_id": {"type": "string", "minLength": 1}},
@@ -475,9 +486,12 @@ TOOLS = {
 
 
 for _name, _fn, _description, _has_id, _paged in [
-    ("ack", tool_ack, "Explicitly acknowledge receipt after reading the full envelope. This is not task completion.", True, False),
-    ("message", tool_message, "Retrieve full retained message and envelope. Does not automatically ACK.", True, False),
-    ("inbox", tool_inbox, "Retrieve received messages with cursor pagination. Does not automatically ACK.", False, True),
+    ("ack", tool_ack, "Optionally declare that you read/received this full message. Not required for delivery or replies; "
+     "the plugin automatically confirms durable storage. This declaration does not prove understanding or task completion.", True, False),
+    ("message", tool_message, "Retrieve full retained message and envelope, including injection uncertainty. Earlier unread messages do not hide text. "
+     "Does not make an explicit read declaration.", True, False),
+    ("inbox", tool_inbox, "Retrieve the complete retained inbox with cursor pagination, independent of earlier unread messages. "
+     "Inspect blocked_by_delivery for native presentation uncertainty; this does not make a read declaration.", False, True),
     ("history", tool_history, "Retrieve message events with cursor pagination and explicit pruning information.", True, True),
 ]:
     _properties = {"msg_id": {"type": "string", "minLength": 1}} if _has_id else {}

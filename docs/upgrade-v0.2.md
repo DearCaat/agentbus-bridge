@@ -1,3 +1,8 @@
+> Historical v0.2 upgrade instructions. v0.3 replaces manual-ACK transport gating
+> with automatic durable plugin receipts. For a current installation, follow
+> [Upgrade to v0.3](upgrade-v0.3.md). Do not manually acknowledge other agents'
+> backlog as an upgrade step.
+
 # Upgrade to protocol 2
 
 v0.2.0 changes the agent interface: `agentbus_send` requires a stable caller-chosen

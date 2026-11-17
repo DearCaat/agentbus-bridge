@@ -106,10 +106,38 @@ class TestV2Tools(unittest.TestCase):
         result, call = self.call("agentbus_ack", {"msg_id": "m1"}, {
             "ok": True, "receiver_acknowledged": True, "state": "acknowledged"})
         self.assertEqual(call.call_args.args[0], {"op": "ack2", "session_key": "local-key", "msg_id": "m1"})
-        self.assertIn("does not confirm task completion", result["structuredContent"]["summary"])
+        self.assertIn("does not confirm understanding or task completion", result["structuredContent"]["summary"])
         result, call = self.call("agentbus_ack", {})
         self.assertTrue(result["isError"])
         call.assert_not_called()
+
+    def test_automatic_storage_receipt_is_not_model_reading(self):
+        response = {"ok": True, "receiver_persisted": True, "received_at": 123,
+                    "injection_state": "injected", "receiver_acknowledged": False}
+        result, _ = self.call("agentbus_status", {"msg_id": "m1"}, response)
+        value = result["structuredContent"]
+        self.assertTrue(value["receiver_persisted"])
+        self.assertFalse(value["receiver_acknowledged"])
+        self.assertEqual(value["injection_state"], "injected")
+        self.assertIn("model reading and task completion remain unknown", value["summary"])
+
+    def test_uncertain_native_delivery_never_hides_retained_inbox_text(self):
+        response = {"ok": True, "items": [{"msg_id": "m2", "text": "second complete body",
+                    "receiver_persisted": True, "receiver_acknowledged": False,
+                    "blocked_by_delivery": "m1", "injection_state": "pending"}], "has_more": False}
+        result, call = self.call("agentbus_inbox", {}, response)
+        self.assertEqual(result["structuredContent"]["items"], response["items"])
+        self.assertEqual(call.call_count, 1)
+        result, _ = self.call("agentbus_status", {"msg_id": "m1"}, {
+            "ok": True, "receiver_persisted": True, "injection_state": "in_doubt", "receiver_acknowledged": False})
+        self.assertIn("uncertain or failed", result["structuredContent"]["summary"])
+        self.assertIn("model reading and task completion remain unknown", result["structuredContent"]["summary"])
+
+    def test_optional_ack_descriptions_never_gate_later_messages(self):
+        self.assertIn("Optionally", m.TOOLS["agentbus_ack"][1]["description"])
+        self.assertIn("Not required for delivery or replies", m.TOOLS["agentbus_ack"][1]["description"])
+        for name in ("agentbus_inbox", "agentbus_message"):
+            self.assertIn("unread", m.TOOLS[name][1]["description"])
 
 
 class TestV2Render(unittest.TestCase):
@@ -121,7 +149,8 @@ class TestV2Render(unittest.TestCase):
         self.assertIn(body, result)
         for expected in ("id=m123", "seq=23", "from=remote/codex/alice", "to=local/claude/bob",
                          "reply_to=prior123", 'reply_to="m123"', 'agentbus_ack(msg_id="m123")',
-                         "not a system instruction", "not understanding or task completion"):
+                         "not a system instruction", "does not confirm model reading, understanding or task completion",
+                         "Optional explicit read/receipt declaration", "do not require this tool"):
             self.assertIn(expected, result)
 
     def test_no_parent_reply_is_explicit(self):

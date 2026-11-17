@@ -159,6 +159,7 @@ CREATE TABLE IF NOT EXISTS messages_v2 (
     fingerprint TEXT NOT NULL, state TEXT NOT NULL, detail TEXT,
     attempt INTEGER NOT NULL DEFAULT 0, lease_until REAL,
     created_at REAL NOT NULL, updated_at REAL NOT NULL, acked_at REAL,
+    received_at REAL, injected_at REAL,
     state_revision INTEGER NOT NULL DEFAULT 0,
     history_pruned INTEGER NOT NULL DEFAULT 0,
     UNIQUE (from_key, client_msg_id), UNIQUE (from_key, to_key, seq)
@@ -249,6 +250,25 @@ class Hub(object):
         self.conn.execute("PRAGMA synchronous=FULL")
         self.conn.executescript(SCHEMA)
         self.conn.executescript(SCHEMA_V2)
+        self._write(self._migrate_receipts_op)
+
+    def _migrate_receipts_op(self):
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(messages_v2)")}
+        legacy = "received_at" not in columns
+        if legacy:
+            self.conn.execute("ALTER TABLE messages_v2 ADD COLUMN received_at REAL")
+        if "injected_at" not in columns:
+            self.conn.execute("ALTER TABLE messages_v2 ADD COLUMN injected_at REAL")
+            self.conn.execute("UPDATE messages_v2 SET injected_at=updated_at WHERE state='injected'")
+        if legacy:
+            # Only old-schema ACKs carry this compatibility meaning. New optional
+            # read declarations must never become durable receipts after restart.
+            rows = self.conn.execute("SELECT msg_id,acked_at FROM messages_v2 WHERE acked_at IS NOT NULL").fetchall()
+            for row in rows:
+                self.conn.execute("UPDATE messages_v2 SET received_at=? WHERE msg_id=?", (row["acked_at"], row["msg_id"]))
+                self._event2(row["msg_id"], "legacy_ack_receipt_migrated")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS messages_v2_receipts_head "
+                          "ON messages_v2(from_key,to_key,received_at,seq)")
 
     def close(self):
         with self.lock:
@@ -518,7 +538,7 @@ class Hub(object):
     def _blocked2(self, row):
         previous = self.conn.execute(
             "SELECT msg_id FROM messages_v2 WHERE from_key=? AND to_key=? "
-            "AND seq<? AND acked_at IS NULL ORDER BY seq LIMIT 1",
+            "AND seq<? AND received_at IS NULL ORDER BY seq LIMIT 1",
             (row["from_key"], row["to_key"], row["seq"])).fetchone()
         return previous["msg_id"] if previous else None
 
@@ -527,14 +547,19 @@ class Hub(object):
             "msg_id", "client_msg_id", "from_key", "to_key", "from_address", "to_address",
             "seq", "reply_to", "state", "attempt", "detail", "sha256", "text_bytes",
             "message_order", "state_revision")}
+        injection = row["state"] if row["state"] in ("injected", "failed", "in_doubt") else "unknown"
         out.update(submission="accepted", receiver_acknowledged=row["acked_at"] is not None,
+                   receiver_persisted=row["received_at"] is not None, received_at=_iso(row["received_at"]),
+                   injected_at=_iso(row["injected_at"]), injection_state=injection,
+                   agent_read=True if row["acked_at"] is not None else None, task_completion=None,
                    blocked_by=self._blocked2(row), body_retained=row["text"] is not None,
                    history_pruned=bool(row["history_pruned"]), observed_at=_iso(time.time()),
                    ordering_scope="sender_to_receiver", created_at=_iso(row["created_at"]),
                    updated_at=_iso(row["updated_at"]), acknowledged_at=_iso(row["acked_at"]),
-                   summary=("Recipient explicitly acknowledged receipt; task completion is unknown."
-                            if row["acked_at"] is not None else
-                            "Accepted by hub; recipient receipt is not acknowledged."))
+                   summary=(("Recipient plugin durably stored the full message. " if row["received_at"] is not None
+                             else "Hub accepted; recipient durable storage is not confirmed. ") +
+                            "Native presentation: %s. Agent read: %s. Task completion: unknown." %
+                            (injection, "explicitly declared" if row["acked_at"] is not None else "unknown")))
         if full:
             out["text"] = row["text"]
         return out
@@ -548,6 +573,8 @@ class Hub(object):
     def _unknown2(self, msg_id):
         return dict(msg_id=msg_id, state="unknown_or_pruned", submission="unknown",
                     receiver_acknowledged=None, body_retained=False, text=None,
+                    receiver_persisted=None, received_at=None, injected_at=None,
+                    injection_state="unknown", agent_read=None, task_completion=None,
                     client_msg_id=None, from_key=None, to_key=None, seq=None,
                     blocked_by=None, attempt=None, state_revision=None,
                     observed_at=_iso(time.time()), ordering_scope="sender_to_receiver",
@@ -591,8 +618,6 @@ class Hub(object):
             previous = self._row2(reply)
             if previous is None or previous["from_key"] != to_key or previous["to_key"] != from_key:
                 raise ApiError(409, "invalid_reply_to", "reply_to must identify the opposite direction between these peers")
-            if self._blocked2(previous):
-                raise ApiError(409, "blocked_reply_to", "reply parent is blocked by an earlier unacknowledged message")
             if previous["text"] is None:
                 raise ApiError(409, "body_pruned", "reply parent content is no longer retained")
         stream = self.conn.execute("SELECT last_enqueued FROM streams_v2 WHERE from_key=? AND to_key=?",
@@ -615,23 +640,28 @@ class Hub(object):
 
     def _sweep2_op(self, now):
         rows = self.conn.execute("SELECT * FROM messages_v2 WHERE state='leased' AND lease_until<? "
-                                 "AND acked_at IS NULL", (now,)).fetchall()
+                                 "AND received_at IS NULL", (now,)).fetchall()
         for row in rows:
             self.conn.execute("UPDATE messages_v2 SET state='queued',lease_until=NULL WHERE msg_id=?",
                               (row["msg_id"],))
             self._event2(row["msg_id"], "lease_expired", now)
         rows = self.conn.execute("SELECT msg_id FROM messages_v2 WHERE state='queued' AND created_at<? "
-                                 "AND acked_at IS NULL", (now-self.queue_ttl,)).fetchall()
+                                 "AND received_at IS NULL", (now-self.queue_ttl,)).fetchall()
         for row in rows:
             self.conn.execute("UPDATE messages_v2 SET state='expired',lease_until=NULL WHERE msg_id=?",
                               (row["msg_id"],))
-            self._event2(row["msg_id"], "queue_expired_blocks_until_ack", now)
-        rows = self.conn.execute("SELECT msg_id FROM messages_v2 WHERE acked_at<? AND text IS NOT NULL",
+            self._event2(row["msg_id"], "queue_expired_without_durable_receipt", now)
+        # A successful native write alone is not a recovery copy. Both durable
+        # storage and successful injection are required without an explicit ACK.
+        eligible_at = ("CASE WHEN acked_at IS NOT NULL THEN acked_at "
+                       "WHEN received_at IS NOT NULL AND injected_at IS NOT NULL AND state='injected' "
+                       "THEN MAX(received_at,injected_at) END")
+        rows = self.conn.execute("SELECT msg_id FROM messages_v2 WHERE (" + eligible_at + ")<? AND text IS NOT NULL",
                                  (now-self.body_retention,)).fetchall()
         for row in rows:
             self.conn.execute("UPDATE messages_v2 SET text=NULL WHERE msg_id=?", (row["msg_id"],))
             self._event2(row["msg_id"], "body_pruned", now)
-        rows = self.conn.execute("SELECT msg_id FROM messages_v2 WHERE acked_at<? AND history_pruned=0",
+        rows = self.conn.execute("SELECT msg_id FROM messages_v2 WHERE (" + eligible_at + ")<? AND history_pruned=0",
                                  (now-self.event_retention,)).fetchall()
         for row in rows:
             # Keep the minimal state/tombstone and record the fact of pruning atomically.
@@ -659,9 +689,9 @@ class Hub(object):
         self._sweep2_op(now)
         rows = self.conn.execute(
             "SELECT m.* FROM messages_v2 m JOIN sessions s ON s.session_key=m.to_key "
-            "WHERE s.machine=? AND s.online=1 AND m.state='queued' AND m.acked_at IS NULL "
+            "WHERE s.machine=? AND s.online=1 AND m.state='queued' AND m.received_at IS NULL "
             "AND NOT EXISTS(SELECT 1 FROM messages_v2 p WHERE p.from_key=m.from_key "
-            "AND p.to_key=m.to_key AND p.seq<m.seq AND p.acked_at IS NULL) "
+            "AND p.to_key=m.to_key AND p.seq<m.seq AND p.received_at IS NULL) "
             "ORDER BY m.message_order LIMIT ?", (machine, PULL_BATCH)).fetchall()
         result = []
         for row in rows:
@@ -671,9 +701,39 @@ class Hub(object):
             result.append(self._snapshot2(self._row2(row["msg_id"]), full=True))
         return result
 
+    def receive2(self, body):
+        msg_id = _req_str(body, "msg_id", maxlen=128)
+        recipient = _req_str(body, "session_key")
+        attempt = _integer(body.get("attempt"), "attempt", 0)
+        sha256 = _req_str(body, "sha256", re.compile(r"[0-9a-f]{64}"), 64)
+        text_bytes = _integer(body.get("text_bytes"), "text_bytes", 1, MAX_TEXT_BYTES)
+        return self._write(self._receive2_op, (msg_id, recipient, attempt, sha256, text_bytes), notify=True)
+
+    def _receive2_op(self, msg_id, recipient, attempt, sha256, text_bytes):
+        row = self._row2(msg_id)
+        if row is None:
+            raise ApiError(404, "unknown_message", "no retained message")
+        if row["to_key"] != recipient:
+            raise ApiError(403, "wrong_recipient", "only exact recipient may confirm durable storage")
+        if row["attempt"] != attempt:
+            raise ApiError(409, "stale_attempt", "receipt does not match current delivery attempt")
+        if row["sha256"] != sha256 or row["text_bytes"] != text_bytes:
+            raise ApiError(409, "integrity_conflict", "receipt does not match immutable message content")
+        if row["received_at"] is not None:
+            return self._snapshot2(row)
+        blocked = self._blocked2(row)
+        if blocked:
+            raise ApiError(409, "blocked_by", "persist predecessor %s first" % blocked)
+        now = time.time()
+        self.conn.execute("UPDATE messages_v2 SET received_at=?,lease_until=NULL,"
+                          "state=CASE WHEN state IN ('queued','leased') THEN 'received' ELSE state END WHERE msg_id=?",
+                          (now, msg_id))
+        self._event2(msg_id, "recipient_persisted", now)
+        return self._snapshot2(self._row2(msg_id))
+
     def report2(self, body):
         msg_id = _req_str(body, "msg_id", maxlen=128)
-        attempt = _integer(body.get("attempt"), "attempt", 1)
+        attempt = _integer(body.get("attempt"), "attempt", 0)
         state = body.get("state")
         if state not in ("injected", "failed", "in_doubt"):
             raise _bad("state must be injected, failed or in_doubt")
@@ -688,16 +748,17 @@ class Hub(object):
             raise ApiError(404, "unknown_message", "no retained message")
         if row["attempt"] != attempt:
             raise ApiError(409, "stale_attempt", "report does not match current delivery attempt")
-        if row["acked_at"] is not None:
-            raise ApiError(409, "already_acknowledged", "recipient ACK cannot be rolled back")
+        if attempt == 0 and row["received_at"] is None:
+            raise ApiError(409, "receipt_required", "attempt zero presentation requires durable recipient storage")
         if row["state"] == state and row["detail"] == detail:
             return self._snapshot2(row)
-        if row["state"] not in ("leased", "queued"):
+        if row["state"] not in ("leased", "queued", "received"):
             raise ApiError(409, "report_conflict", "delivery result already recorded or lease expired")
         # Expiry alone does not prove the injection did not occur; current-attempt results
         # remain useful until a new attempt is issued. Fencing is by attempt, never clock.
-        self.conn.execute("UPDATE messages_v2 SET state=?,detail=?,lease_until=NULL WHERE msg_id=?",
-                          (state, detail, msg_id))
+        self.conn.execute("UPDATE messages_v2 SET state=?,detail=?,lease_until=NULL,"
+                          "injected_at=CASE WHEN ?='injected' THEN COALESCE(injected_at,?) ELSE injected_at END WHERE msg_id=?",
+                          (state, detail, state, time.time(), msg_id))
         self._event2(msg_id, "node_report")
         return self._snapshot2(self._row2(msg_id))
 
@@ -714,13 +775,8 @@ class Hub(object):
             raise ApiError(403, "wrong_recipient", "only recipient may acknowledge")
         if row["acked_at"] is not None:
             return self._snapshot2(row)
-        blocked = self._blocked2(row)
-        if blocked:
-            raise ApiError(409, "blocked_by", "acknowledge predecessor %s first" % blocked)
-        if row["text"] is None:
-            raise ApiError(409, "body_pruned", "full body is no longer retained")
         now = time.time()
-        self.conn.execute("UPDATE messages_v2 SET state='acknowledged',acked_at=?,lease_until=NULL,detail=NULL "
+        self.conn.execute("UPDATE messages_v2 SET acked_at=? "
                           "WHERE msg_id=?", (now, msg_id))
         self._event2(msg_id, "recipient_ack", now)
         return self._snapshot2(self._row2(msg_id))
@@ -812,6 +868,7 @@ _ROUTES = {
     ("POST", "/v2/send"),
     ("GET", "/v2/pull"),
     ("POST", "/v2/report"),
+    ("POST", "/v2/receive"),
     ("POST", "/v2/ack"),
     ("GET", "/v2/status"),
     ("GET", "/v2/message"),
@@ -899,7 +956,8 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path
         try:
             if method == "GET" and path == "/v1/health":
-                self._send_json(200, {"ok": True, "version": VERSION, "protocols": [1, 2]})
+                self._send_json(200, {"ok": True, "version": VERSION, "protocols": [1, 2],
+                                      "capabilities": ["durable_receipts"]})
                 return
             if path not in _PATHS:
                 raise ApiError(404, "not_found", "no such endpoint")
@@ -954,6 +1012,8 @@ class Handler(BaseHTTPRequestHandler):
             return hub.send2(body)
         if path == "/v2/report":
             return hub.report2(body)
+        if path == "/v2/receive":
+            return hub.receive2(body)
         if path == "/v2/ack":
             return hub.ack2(body)
         if path == "/v1/register":
@@ -1038,9 +1098,9 @@ def main(argv=None):
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--body-retention-days", type=_positive_days, default=7,
-                        help="prune ACKed message bodies after this many days (default: 7)")
+                        help="retain eligible message bodies for this many days (default: 7)")
     parser.add_argument("--event-retention-days", type=_positive_days, default=30,
-                        help="prune ACKed message history after this many days (default: 30)")
+                        help="retain eligible message history for this many days (default: 30)")
     parser.add_argument("--log-file", help="private rotating JSON log; default: stderr without built-in rotation")
     parser.add_argument("--log-max-bytes", type=_positive_int, default=LOG_MAX_BYTES,
                         help="positive log rotation size in bytes (default: 5242880)")

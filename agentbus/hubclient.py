@@ -118,6 +118,9 @@ class HubClient:
     def report2(self, body):
         return self._call('POST', '/v2/report', body=body)
 
+    def receive2(self, body):
+        return self._call('POST', '/v2/receive', body=body)
+
     def ack2(self, body):
         return self._call('POST', '/v2/ack', body=body)
 

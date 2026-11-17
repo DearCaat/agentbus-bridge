@@ -3,6 +3,7 @@
 All configuration, SQLite files, fake credentials and harness sinks are temporary.
 No production address, messaging socket, Codex binary or service is contacted.
 """
+import hashlib
 import json
 import os
 import tempfile
@@ -74,75 +75,119 @@ class TestEndToEndV2(unittest.TestCase):
         self.assertFalse(error, "%s: %s" % (name, text))
         return json.loads(text)
 
-    def test_ack_controls_native_delivery_and_retrieval_and_reply_association(self):
-        body_a = "A 完整正文\n" * 2000 + "A FINAL LINE"
-        body_b = "B 暂不可见正文\n" * 2000 + "B FINAL LINE"
-        target = self.receiver_info["address"]
-        sent_a = self.call(self.sender, "agentbus_send", {
-            "to": target, "text": body_a, "request_id": "stable-a"})
-        sent_b = self.call(self.sender, "agentbus_send", {
-            "to": target, "text": body_b, "request_id": "stable-b"})
-        self.assertEqual(sent_a["submission"], "accepted")
-        self.assertEqual(sent_b["submission"], "accepted")
-        self.assertEqual(sent_a["request_id"], "stable-a")
-        self.assertEqual(sent_b["request_id"], "stable-b")
-        self.assertEqual((sent_a["seq"], sent_b["seq"]), (1, 2))
-        self.assertEqual(sent_b["blocked_by"], sent_a["msg_id"])
-        self.assertTrue(wait_for(lambda: len(self.claude.payloads()) == 1))
-        observed_a = claude_contents(self.claude.payloads())
-        self.assertEqual(len(observed_a), 1)
-        self.assertIn(body_a, observed_a[0])
-        self.assertNotIn(body_b, observed_a[0])
-        self.assertIn('agentbus_ack(msg_id="%s")' % sent_a["msg_id"], observed_a[0])
+    def send_three(self):
+        self.assertIn("durable_receipts", self.node.hub.health().get("capabilities", []))
+        bodies = ["Message %s 完整正文\n" % i * 1500 + "FINAL %s" % i for i in (1, 2, 3)]
+        sent = [self.call(self.sender, "agentbus_send", {
+            "to": self.receiver_info["address"], "text": body, "request_id": "stable-%s" % i})
+            for i, body in enumerate(bodies, 1)]
+        self.assertEqual([x["seq"] for x in sent], [1, 2, 3])
+        self.assertEqual([x["request_id"] for x in sent], ["stable-1", "stable-2", "stable-3"])
+        self.assertTrue(all(x["submission"] == "accepted" for x in sent))
+        return sent, bodies
 
-        message_a = self.call(self.receiver, "agentbus_message", {"msg_id": sent_a["msg_id"]})
-        self.assertEqual(message_a["text"], body_a)
-        message_b = self.call(self.receiver, "agentbus_message", {"msg_id": sent_b["msg_id"]})
-        self.assertFalse(message_b["content_visible"])
-        self.assertNotIn("text", message_b)
-        self.assertEqual(message_b["blocked_by"], sent_a["msg_id"])
-        inbox = self.call(self.receiver, "agentbus_inbox", {"limit": 1})
-        self.assertTrue(inbox["has_more"])
-        self.assertEqual(inbox["items"][0]["text"], body_a)
-        second_page = self.call(self.receiver, "agentbus_inbox", {"after": inbox["next_cursor"], "limit": 1})
-        self.assertEqual(second_page["items"][0]["msg_id"], sent_b["msg_id"])
-        self.assertFalse(second_page["items"][0]["content_visible"])
-        self.assertNotIn("text", second_page["items"][0])
-        status_a = self.call(self.sender, "agentbus_status", {"request_id": "stable-a"})
-        self.assertFalse(status_a["receiver_acknowledged"])
-        # Several actual polling cycles must not inject B after either retrieval path.
-        self.assertFalse(wait_for(lambda: len(self.claude.payloads()) > 1, timeout=0.5))
+    def sender_statuses(self, sent):
+        return [self.call(self.sender, "agentbus_status", {"msg_id": item["msg_id"]}) for item in sent]
 
-        ack = self.call(self.receiver, "agentbus_ack", {"msg_id": sent_a["msg_id"]})
-        self.assertTrue(ack["receiver_acknowledged"])
-        self.assertTrue(wait_for(lambda: len(self.claude.payloads()) == 2))
-        observed_b = claude_contents(self.claude.payloads())[1]
-        self.assertIn(body_b, observed_b)
-        self.assertIn("seq=2", observed_b)
-        visible_b = self.call(self.receiver, "agentbus_message", {"msg_id": sent_b["msg_id"]})
-        self.assertEqual(visible_b["text"], body_b)
-        status_a = self.call(self.sender, "agentbus_status", {"msg_id": sent_a["msg_id"]})
-        self.assertEqual(status_a["state"], "acknowledged")
-        self.assertTrue(status_a["receiver_acknowledged"])
-        self.assertIn("task completion", status_a["summary"])
-        self.assertIn("unknown", status_a["summary"])
+    def assert_full_inbox(self, sent, bodies):
+        items, after = [], 0
+        while True:
+            page = self.call(self.receiver, "agentbus_inbox", {"after": after, "limit": 1})
+            items.extend(page["items"])
+            if not page["has_more"]:
+                break
+            self.assertGreater(page["next_cursor"], after)
+            after = page["next_cursor"]
+        self.assertEqual([x["msg_id"] for x in items], [x["msg_id"] for x in sent])
+        self.assertEqual([x["text"] for x in items], bodies)
+        self.assertEqual(self.node.store._query("PRAGMA synchronous")[0][0], 2)
+        for message, body in zip(sent, bodies):
+            row = self.node.store._query("SELECT envelope,received_at,receipt_sent FROM incoming2 WHERE msg_id=?",
+                                         (message["msg_id"],))[0]
+            saved = json.loads(row["envelope"])
+            self.assertEqual(saved["text"], body)
+            self.assertEqual(saved["sha256"], hashlib.sha256(body.encode("utf-8")).hexdigest())
+            self.assertEqual(saved["text_bytes"], len(body.encode("utf-8")))
+            self.assertIsNotNone(row["received_at"])
+            self.assertEqual(row["receipt_sent"], 1)
+        for message, body in zip(sent, bodies):
+            fetched = self.call(self.receiver, "agentbus_message", {"msg_id": message["msg_id"]})
+            self.assertEqual(fetched["text"], body)
+        return items
 
-        # Opposite-direction reply does not need to wait for B's ACK.
-        reply_body = "Reply to exactly A, while B remains unacknowledged."
+    def test_three_messages_persist_and_inject_in_order_without_manual_ack(self):
+        sent, bodies = self.send_three()
+        self.assertTrue(wait_for(lambda: len(self.claude.payloads()) == 3), "native presentation requires no manual ACK")
+        observed = claude_contents(self.claude.payloads())
+        self.assertEqual(len(observed), 3)
+        for index, (envelope, body) in enumerate(zip(observed, bodies), 1):
+            self.assertIn(body, envelope)
+            self.assertIn("seq=%s" % index, envelope)
+            self.assertIn("Optional explicit read/receipt declaration", envelope)
+            self.assertNotIn("After reading the full envelope, explicitly call", envelope)
+        self.assert_full_inbox(sent, bodies)
+        statuses = self.sender_statuses(sent)
+        for status in statuses:
+            self.assertTrue(status["receiver_persisted"])
+            self.assertIsNotNone(status["received_at"])
+            self.assertFalse(status["receiver_acknowledged"], "automatic receipt must never invent agent reading")
+            self.assertEqual(status["injection_state"], "injected")
+            self.assertIn("unknown", status["summary"])
+            self.assertIsNone(status["agent_read"], "automatic storage must not invent a read declaration")
+            self.assertIsNone(status["task_completion"])
+
+        reply_body = "Reply to exactly message 1; no read declaration was needed."
         reply = self.call(self.receiver, "agentbus_send", {
             "to": self.sender_info["address"], "text": reply_body,
-            "request_id": "stable-answer-a", "reply_to": sent_a["msg_id"]})
-        self.assertEqual(reply["reply_to"], sent_a["msg_id"])
+            "request_id": "stable-answer-1", "reply_to": sent[0]["msg_id"]})
+        self.assertEqual(reply["reply_to"], sent[0]["msg_id"])
         self.assertEqual(reply["seq"], 1)
         retrieved = self.call(self.sender, "agentbus_message", {"msg_id": reply["msg_id"]})
-        self.assertEqual(retrieved["reply_to"], sent_a["msg_id"])
+        self.assertEqual(retrieved["reply_to"], sent[0]["msg_id"])
         self.assertEqual(retrieved["text"], reply_body)
         self.assertTrue(wait_for(lambda: os.path.exists(self.codex_output) and os.path.getsize(self.codex_output) > 0))
         with open(self.codex_output, encoding="utf-8") as handle:
             native_reply = json.loads(handle.readline())["argv"][-1]
         self.assertIn(reply_body, native_reply)
-        self.assertIn("reply_to=" + sent_a["msg_id"], native_reply)
-        self.assertFalse(self.call(self.sender, "agentbus_status", {"msg_id": sent_b["msg_id"]})["receiver_acknowledged"])
+        self.assertIn("reply_to=" + sent[0]["msg_id"], native_reply)
+        self.assertTrue(all(not x["receiver_acknowledged"] for x in self.sender_statuses(sent)))
+
+        # A late optional declaration must not roll native success back or hold successors.
+        ack = self.call(self.receiver, "agentbus_ack", {"msg_id": sent[0]["msg_id"]})
+        self.assertTrue(ack["receiver_acknowledged"])
+        after_ack = self.sender_statuses(sent)
+        self.assertTrue(after_ack[0]["receiver_acknowledged"])
+        self.assertEqual([x["injection_state"] for x in after_ack], ["injected"] * 3)
+        self.assertEqual(len(self.claude.payloads()), 3)
+
+    def test_uncertain_native_predecessor_keeps_complete_durable_inbox(self):
+        real_inject = self.node._inject
+        def lose_native_result(message):
+            outcome, detail = real_inject(message)
+            self.assertEqual(outcome, "delivered", detail)
+            return "failed", "in_doubt: synthetic lost native socket result"
+        with mock.patch.object(self.node, "_inject", side_effect=lose_native_result):
+            sent, bodies = self.send_three()
+            self.assertTrue(wait_for(lambda: all(x.get("receiver_persisted") for x in self.sender_statuses(sent))))
+            items = self.assert_full_inbox(sent, bodies)
+            self.assertTrue(wait_for(lambda: self.sender_statuses(sent)[0].get("injection_state") == "in_doubt"))
+            self.assertFalse(wait_for(lambda: len(self.claude.payloads()) > 1, timeout=0.5),
+                             "uncertain native input must never be blindly repeated or skipped")
+            self.assertEqual(len(self.claude.payloads()), 1)
+            self.assertIn(bodies[0], claude_contents(self.claude.payloads())[0])
+            for later in items[1:]:
+                self.assertEqual(later["blocked_by_delivery"], sent[0]["msg_id"])
+                self.assertIn("text", later)
+            statuses = self.sender_statuses(sent)
+            self.assertTrue(all(x["receiver_persisted"] for x in statuses))
+            self.assertTrue(all(not x["receiver_acknowledged"] for x in statuses))
+            self.call(self.receiver, "agentbus_ack", {"msg_id": sent[0]["msg_id"]})
+            self.node.reliable().recover(force=True)
+            self.assertFalse(wait_for(lambda: len(self.claude.payloads()) > 1, timeout=0.5),
+                             "optional declaration must not skip an uncertain native predecessor")
+            first = self.sender_statuses(sent)[0]
+            self.assertEqual(first["injection_state"], "in_doubt")
+            self.assertTrue(first["receiver_acknowledged"])
 
 
 if __name__ == "__main__":

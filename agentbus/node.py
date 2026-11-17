@@ -284,6 +284,9 @@ class Store:
         self._db = sqlite3.connect(path, timeout=10, isolation_level=None, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.execute("PRAGMA synchronous=FULL")
+        if path != ':memory:' and os.path.isfile(path):
+            os.chmod(path, 0o600)
         self._db.executescript(SCHEMA)
 
     def close(self):
@@ -804,6 +807,7 @@ class Node:
                 reliable = self.reliable()
                 if reliable.available():
                     reliable.flush()
+                    reliable.recover()
                     incoming = self.hub.pull2(self.machine, min(self.poll_wait, 1.0))
                     for message in incoming.get('messages', []):
                         if self._stop.is_set():
@@ -820,6 +824,13 @@ class Node:
                     msgs = self.hub.pull(self.machine, self.poll_wait)
             except HubError as e:
                 self._log("pull failed: %s; retry in %.0fs" % (e, delay))
+                self._stop.wait(delay)
+                delay = min(delay * 2, BACKOFF_MAX)
+                continue
+            except Exception as exc:
+                # A transient spool/SQLite failure must not silently kill the
+                # receiver thread while its process/socket still appear healthy.
+                self._log("receive cycle interrupted: %s; will retry" % type(exc).__name__)
                 self._stop.wait(delay)
                 delay = min(delay * 2, BACKOFF_MAX)
                 continue

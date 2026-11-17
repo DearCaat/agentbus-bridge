@@ -37,7 +37,7 @@ def _render_legacy(msg_id, from_address, text, local_harness):
 
 
 def render(msg_id, from_address, text, local_harness=None, metadata=None):
-    """Render the complete untrusted cross-session envelope; never acknowledge here."""
+    """Render the complete cross-session envelope; read declarations are optional."""
     if metadata is None:
         return _render_legacy(msg_id, from_address, text, local_harness)
     if local_harness:
@@ -53,8 +53,11 @@ def render(msg_id, from_address, text, local_harness=None, metadata=None):
                     from_address, meta.get("to_address") or meta.get("to_key") or "unknown (legacy)",
                     meta.get("reply_to") or "none", meta.get("ordering_scope", "sender_to_receiver"), text, tail)
     if metadata is not None:
-        envelope += ('\nAfter reading the full envelope, explicitly call agentbus_ack(msg_id="%s"). '
-                     'ACK declares receipt only, not understanding or task completion. Retrieval and reply do not ACK.') % msg_id
+        envelope += ('\nThe plugin automatically confirms receipt after durable local storage. '
+                     'This does not confirm model reading, understanding or task completion. '
+                     'Reading and replies do not block later messages. '
+                     'Optional explicit read/receipt declaration: agentbus_ack(msg_id="%s"); '
+                     'ordinary receipt and replies do not require this tool.') % msg_id
     return envelope
 
 

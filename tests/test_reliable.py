@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -15,6 +16,7 @@ class Link:
     def __init__(self, hub):
         self.hub = hub
         self.lose_send = False
+        self.lose_receive = False
         self.offline = False
 
     def __getattr__(self, key):
@@ -29,13 +31,16 @@ class Link:
             if key == 'send2' and self.lose_send:
                 self.lose_send = False
                 raise HubError(0, 'unreachable', 'synthetic lost response after COMMIT')
+            if key == 'receive2' and self.lose_receive:
+                self.lose_receive = False
+                raise HubError(0, 'unreachable', 'synthetic lost receipt response after COMMIT')
             return result
         return wrapped
 
     def health(self):
         if self.offline:
             raise HubError(0, 'unreachable')
-        return {'ok': True, 'protocols': [1, 2]}
+        return {'ok': True, 'protocols': [1, 2], 'capabilities': ['durable_receipts']}
 
 
 class ReliabilityTests(unittest.TestCase):
@@ -93,25 +98,23 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(second['request_id'], first['request_id'])
         self.assertEqual(second['submission'], 'unconfirmed')
 
-    def test_ack_gates_next_and_inbox_never_exposes_later_body(self):
+    def test_durable_receipt_gates_transport_but_unread_inbox_is_complete(self):
         a = self.send(text='eleven')
         b = self.send('request-2', 'twelve')
         self.assertEqual(b['blocked_by'], a['msg_id'])
         peek = self.incoming('message2', msg_id=b['msg_id'])
-        self.assertFalse(peek['content_visible'])
-        self.assertNotIn('text', peek)
-        later = next(x for x in self.incoming('inbox2')['items'] if x['msg_id']==b['msg_id'])
-        self.assertNotIn('text', later)
+        self.assertTrue(peek['content_visible'])
+        self.assertEqual(peek['text'], 'twelve')
         first = self.hub.pull2('target', 0)[0]
         self.receiver.reliable().handle(first)
         self.assertEqual(self.observed, [a['msg_id']])
-        self.assertEqual(self.hub.pull2('target', 0), [])
-        denied = self.incoming('ack2', msg_id=b['msg_id'])
-        self.assertEqual(denied['error'], 'blocked_by')
-        self.incoming('ack2', msg_id=a['msg_id'])
         second = self.hub.pull2('target', 0)[0]
         self.receiver.reliable().handle(second)
         self.assertEqual(self.observed, [a['msg_id'], b['msg_id']])
+        for item in (a,b):
+            status=self.hub.status2(item['msg_id'],self.a['session_key'])
+            self.assertTrue(status['receiver_persisted'])
+            self.assertFalse(status['receiver_acknowledged'])
 
     def test_reply_parent_must_be_same_exact_peers(self):
         first = self.send()
@@ -122,6 +125,114 @@ class ReliabilityTests(unittest.TestCase):
         self.assertTrue(reply['ok'])
         self.assertEqual(reply['reply_to'], first['msg_id'])
 
+    def test_three_messages_progress_without_agent_ack(self):
+        sent = [self.send('auto-%d' % i, 'body-%d' % i) for i in range(3)]
+        for i in range(3):
+            incoming = self.hub.pull2('target', 0)
+            self.assertEqual(len(incoming), 1, 'human ACK must not gate next delivery')
+            self.receiver.reliable().handle(incoming[0])
+        self.assertEqual(self.observed, [x['msg_id'] for x in sent])
+        for item in sent:
+            state = self.hub.status2(item['msg_id'], self.a['session_key'])
+            self.assertTrue(state['receiver_persisted'])
+            self.assertFalse(state['receiver_acknowledged'])
+
+    def test_lost_receipt_response_replays_without_duplicate_injection(self):
+        sent = self.send()
+        self.receiver.hub.lose_receive = True
+        self.receiver.reliable().handle(self.hub.pull2('target', 0)[0])
+        self.assertTrue(self.hub.status2(sent['msg_id'],self.a['session_key'])['receiver_persisted'])
+        self.assertEqual(self.observed, [])
+        self.receiver.reliable().recover(force=True)
+        self.receiver.reliable().recover(force=True)
+        self.assertEqual(self.observed,[sent['msg_id']])
+        self.assertEqual(self.hub.conn.execute("SELECT count(*) FROM events_v2 WHERE msg_id=? AND reason='recipient_persisted'",(sent['msg_id'],)).fetchone()[0],1)
+
+    def test_storage_failure_never_sends_receipt(self):
+        sent = self.send()
+        message = self.hub.pull2('target',0)[0]
+        with patch.object(self.receiver.reliable(),'_persist',side_effect=OSError('synthetic disk failure')):
+            with self.assertRaises(OSError):
+                self.receiver.reliable().handle(message)
+        self.assertFalse(self.hub.status2(sent['msg_id'],self.a['session_key'])['receiver_persisted'])
+        self.assertEqual(self.observed,[])
+
+    def test_committed_full_envelope_survives_restart_before_receipt(self):
+        with tempfile.TemporaryDirectory(prefix='agentbus-receive-restart-') as temp:
+            self.receiver.store.close()
+            self.receiver.store=Store(temp+'/node.db')
+            self.receiver._reliable=None
+            sent=self.send()
+            message=self.hub.pull2('target',0)[0]
+            self.receiver.reliable()._persist(message)
+            self.receiver.store.close()
+            self.receiver.store=Store(temp+'/node.db')
+            self.receiver._reliable=None
+            self.receiver.reliable().recover(force=True)
+            row=self.receiver.reliable()._row('SELECT * FROM incoming2 WHERE msg_id=?',(sent['msg_id'],))
+            self.assertEqual(json.loads(row['envelope'])['text'],'body')
+            self.assertEqual(self.receiver.store._query('PRAGMA synchronous')[0][0],2)
+            self.assertEqual(self.observed,[sent['msg_id']])
+            self.assertTrue(self.hub.status2(sent['msg_id'],self.a['session_key'])['receiver_persisted'])
+
+    def test_legacy_injected_head_backfills_without_duplicate_notification(self):
+        first=self.send()
+        second=self.send('later','next')
+        message=self.hub.pull2('target',0)[0]
+        reliable=self.receiver.reliable()
+        self.receiver.store._exec("INSERT INTO incoming2(msg_id,from_key,to_key,seq,state,detail,attempt,updated_at) VALUES (?,?,?,?,'injected',NULL,?,1)",(message['msg_id'],message['from_key'],message['to_key'],message['seq'],message['attempt']))
+        self.hub.report2(dict(msg_id=first['msg_id'],attempt=message['attempt'],state='injected'))
+        reliable.recover(force=True)
+        self.assertEqual(self.observed,[])
+        self.assertTrue(self.hub.status2(first['msg_id'],self.a['session_key'])['receiver_persisted'])
+        reliable.handle(self.hub.pull2('target',0)[0])
+        self.assertEqual(self.observed,[second['msg_id']])
+
+    def test_optional_read_does_not_erase_uncertain_native_injection(self):
+        first=self.send()
+        second=self.send('later','next')
+        self.receiver._inject=lambda m:('failed','in_doubt: synthetic uncertain native result')
+        r=self.receiver.reliable()
+        r.handle(self.hub.pull2('target',0)[0])
+        self.assertTrue(self.incoming('ack2',msg_id=first['msg_id'])['receiver_acknowledged'])
+        r.handle(self.hub.pull2('target',0)[0])
+        self.receiver._inject=lambda m:self.fail('read ACK must not silently resolve native uncertainty')
+        r.recover(force=True)
+        item=self.incoming('message2',msg_id=second['msg_id'])
+        self.assertEqual(item['text'],'next')
+        self.assertEqual(item['blocked_by_delivery'],first['msg_id'])
+
+    def test_transient_recovery_storage_failure_does_not_kill_pull_loop(self):
+        r=self.receiver.reliable()
+        called=[]
+        def recover():
+            called.append(True)
+            if len(called)==1:
+                raise sqlite3.OperationalError('synthetic transient spool failure')
+            self.receiver._stop.set()
+        self.receiver.hub.pull2=lambda *a:{'messages':[]}
+        self.receiver.hub.pull=lambda *a:{'messages':[]}
+        with patch.object(r,'recover',side_effect=recover):
+            self.receiver._pull_loop()
+        self.assertEqual(len(called),2)
+
+    def test_local_full_body_cleanup_only_after_safe_hub_pruning(self):
+        sent=self.send()
+        r=self.receiver.reliable()
+        r.handle(self.hub.pull2('target',0)[0])
+        self.receiver.store._exec('UPDATE incoming2 SET received_at=0')
+        r.maintenance()
+        self.assertIsNotNone(r._row('SELECT envelope FROM incoming2 WHERE msg_id=?',(sent['msg_id'],))['envelope'])
+        self.hub.conn.execute('UPDATE messages_v2 SET received_at=0,injected_at=0')
+        self.hub.sweep2()
+        r.prune_at=0
+        r.maintenance()
+        row=r._row('SELECT * FROM incoming2 WHERE msg_id=?',(sent['msg_id'],))
+        self.assertIsNone(row['envelope'])
+        self.assertEqual(row['body_pruned'],1)
+        r.recover(force=True)
+        self.assertEqual(self.observed,[sent['msg_id']])
+
     def test_ack_races_report_without_rolling_back_local_or_hub_state(self):
         sent = self.send()
         def early_ack(m):
@@ -130,8 +241,9 @@ class ReliabilityTests(unittest.TestCase):
         self.receiver._inject = early_ack
         self.receiver.reliable().handle(self.hub.pull2('target', 0)[0])
         row = self.receiver.reliable()._row('SELECT * FROM incoming2 WHERE msg_id=?', (sent['msg_id'],))
-        self.assertEqual(row['state'], 'acknowledged')
-        self.assertEqual(self.hub.status2(sent['msg_id'], self.a['session_key'])['state'], 'acknowledged')
+        self.assertEqual(row['state'], 'injected')
+        self.assertEqual(self.hub.status2(sent['msg_id'], self.a['session_key'])['state'], 'injected')
+        self.assertTrue(self.hub.status2(sent['msg_id'], self.a['session_key'])['receiver_acknowledged'])
 
     def test_ambiguous_injection_is_not_blindly_retried(self):
         sent = self.send()
@@ -168,6 +280,9 @@ class ReliabilityTests(unittest.TestCase):
         status = self.sender.dispatch(dict(op='status2', session_key=self.a['session_key'],client_msg_id='request-1'))
         self.assertTrue(status['current_status_unknown'])
         self.assertIsNone(status['receiver_acknowledged'])
+        self.assertIsNone(status['receiver_persisted'])
+        self.assertEqual(status['injection_state'],'unknown')
+        self.assertEqual(status['state'],'unknown')
 
     def test_old_hub_rejected_without_sending(self):
         self.sender.hub.health = lambda: {'ok': True, 'version': 'legacy'}

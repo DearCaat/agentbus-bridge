@@ -1,8 +1,8 @@
 # agentbus SPEC v0.1 (legacy compatibility)
 
 The current reliability contract is [protocol 2](docs/protocol-v2.md). This file
-documents the retained legacy endpoints; it does not provide the new ACK/order
-guarantees. See README and the upgrade procedure before adopting v0.2.0.
+documents the retained legacy endpoints; it does not provide the current durable
+receipt/order guarantees. See README and [the v0.3 upgrade procedure](docs/upgrade-v0.3.md).
 
 Cross-harness (Claude Code, Codex) and cross-machine messaging between live agent sessions.
 Same-machine same-harness traffic is out of scope (use the harness's native messaging).

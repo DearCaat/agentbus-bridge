@@ -1,7 +1,7 @@
 """Durable protocol-2 sender and recipient gate for the per-machine node.
 
 Only metadata is logged. A persisted request key survives lost RPC/HTTP replies.
-Unacknowledged heads block their own directional stream, not other streams.
+Transport receipts follow durable local storage; agent read receipts are optional.
 """
 import hashlib
 import json
@@ -21,7 +21,9 @@ CREATE TABLE IF NOT EXISTS outbox2 (
 CREATE TABLE IF NOT EXISTS incoming2 (
  msg_id TEXT PRIMARY KEY, from_key TEXT NOT NULL, to_key TEXT NOT NULL,
  seq INTEGER NOT NULL, state TEXT NOT NULL, detail TEXT, attempt INTEGER NOT NULL,
- updated_at REAL NOT NULL
+ updated_at REAL NOT NULL, envelope TEXT, received_at REAL,
+ receipt_sent INTEGER NOT NULL DEFAULT 0, report_sent INTEGER NOT NULL DEFAULT 0,
+ body_pruned INTEGER NOT NULL DEFAULT 0
 );
 '''
 
@@ -35,12 +37,18 @@ class Reliable:
         self.node = node
         self.store = node.store
         self.send_lock = threading.Lock()
+        self.receive_lock = threading.RLock()
         self.protocol_ok = False
         self.protocol_state = "unknown"
         self.health_check_at = 0.0
         self.prune_at = 0.0
+        self.recover_at = 0.0
         with self.store._lock:
             self.store._db.executescript(DDL)
+            columns = {r[1] for r in self.store._db.execute('PRAGMA table_info(incoming2)')}
+            for name, spec in [('envelope', 'TEXT'), ('received_at', 'REAL'), ('receipt_sent', 'INTEGER NOT NULL DEFAULT 0'), ('report_sent', 'INTEGER NOT NULL DEFAULT 0'), ('body_pruned', 'INTEGER NOT NULL DEFAULT 0')]:
+                if name not in columns:
+                    self.store._db.execute('ALTER TABLE incoming2 ADD COLUMN '+name+' '+spec)
             self.store._db.execute("UPDATE incoming2 SET state='in_doubt',detail='node restarted during injection' WHERE state='injecting'")
 
     def available(self):
@@ -51,7 +59,9 @@ class Reliable:
             return False
         self.health_check_at = now + 2
         try:
-            self.protocol_ok = 2 in self.node.hub.health().get('protocols', [])
+            health = self.node.hub.health()
+            self.protocol_ok = (2 in health.get('protocols', []) and
+                                'durable_receipts' in health.get('capabilities', []))
             self.protocol_state = 'supported' if self.protocol_ok else 'legacy'
         except (HubError, AttributeError):
             self.protocol_state = 'unknown'
@@ -73,7 +83,7 @@ class Reliable:
             if req.get('op') == 'status2' and req.get('client_msg_id'):
                 return self.status(key, req)
             return {'ok': False, 'error': 'protocol_upgrade_required' if self.protocol_state == 'legacy' else 'hub_unreachable',
-                    'detail': 'Hub protocol 2 is not confirmed. No new reliable send was attempted; delivery is unknown. Retry with the SAME request_id.'}
+                    'detail': 'Hub durable_receipts capability is not confirmed. No new reliable send was attempted; delivery is unknown. Retry with the SAME request_id.'}
         try:
             op = req['op']
             if op == 'send2':
@@ -93,7 +103,7 @@ class Reliable:
                 if unavailable:
                     result['complete'] = False
                     result['content_unavailable_ids'] = unavailable
-                    result['summary'] = 'Some content is blocked or pruned. Inspect each item; missing content is not an empty reply.'
+                    result['summary'] = 'Some content is pruned or unavailable. Inspect each item; missing content is not an empty reply.'
                 return dict(result, ok=True)
             return {'ok': False, 'error': 'unknown_op'}
         except HubError as e:
@@ -126,8 +136,6 @@ class Reliable:
                 parent = self.node.hub.message2(reply_to, key)
                 if parent.get('from_key') != target or parent.get('to_key') != key:
                     raise ValueError('reply_to must identify a received message from this exact peer.')
-                if parent.get('blocked_by'):
-                    raise ValueError('reply_to is blocked by an unacknowledged predecessor; do not reply to unseen later content.')
                 if not parent.get('body_retained', True):
                     raise ValueError('reply_to body was pruned; retrieve original context before replying.')
             fingerprint = digest(json.dumps([target, text, reply_to], ensure_ascii=False))
@@ -163,7 +171,11 @@ class Reliable:
             try:
                 response = self.node.hub.status2(response['msg_id'], row['from_key'])
             except HubError:
-                response = dict(response, freshness='cached', current_status_unknown=True, receiver_acknowledged=None,
+                response = dict(response, freshness='cached', current_status_unknown=True,
+                                last_observed_state=response.get('state'), state='unknown',
+                                last_observed_receiver_persisted=response.get('receiver_persisted'),
+                                receiver_acknowledged=None, receiver_persisted=None,
+                                injection_state='unknown', agent_read=None, task_completion=None,
                                 summary='Hub accepted earlier; current delivery/ACK status cannot be checked.')
         if response:
             return dict(response, ok=True, request_id=row['request_id'], submission='accepted')
@@ -226,11 +238,20 @@ class Reliable:
                 state = self.node.hub.status2(saved['msg_id'], row['from_key'])
             except HubError:
                 break
-            prunable = state.get('receiver_acknowledged') is True and state.get('body_retained') is False
+            prunable = (state.get('receiver_acknowledged') is True or state.get('receiver_persisted') is True) and state.get('body_retained') is False
             if prunable:
                 self.store._exec('UPDATE outbox2 SET text=NULL,response=?,updated_at=? WHERE from_key=? AND request_id=?', (json.dumps(state), now, row['from_key'], row['request_id']))
             else:
                 self.store._exec('UPDATE outbox2 SET response=?,updated_at=? WHERE from_key=? AND request_id=?', (json.dumps(state), now, row['from_key'], row['request_id']))
+        for row in self._rows("SELECT * FROM incoming2 WHERE envelope IS NOT NULL AND receipt_sent=1 AND state IN ('injected','acknowledged') AND received_at<? ORDER BY updated_at LIMIT 32", (now-7*86400,)):
+            try:
+                state = self.node.hub.status2(row['msg_id'],row['to_key'])
+            except HubError:
+                break
+            if state.get('receiver_persisted') is True and state.get('body_retained') is False:
+                self.store._exec('UPDATE incoming2 SET envelope=NULL,body_pruned=1,updated_at=? WHERE msg_id=?',(now,row['msg_id']))
+            else:
+                self.store._exec('UPDATE incoming2 SET updated_at=? WHERE msg_id=?',(now,row['msg_id']))
 
     def status(self, key, req):
         mid, cid = req.get('msg_id'), req.get('client_msg_id')
@@ -246,28 +267,114 @@ class Reliable:
 
     def ack(self, key, req):
         result = self.node.hub.ack2({'msg_id': req['msg_id'], 'session_key': key})
-        self.store._exec("UPDATE incoming2 SET state='acknowledged',updated_at=? WHERE msg_id=?", (time.time(), req['msg_id']))
         return dict(result, ok=True)
 
-    @staticmethod
-    def visible(message, key):
+    def visible(self, message, key):
         out = dict(message)
-        if out.get('to_key') == key and out.get('state') != 'acknowledged' and out.get('blocked_by'):
-            out.pop('text', None)
-            out['content_visible'] = False
-            out['summary'] = 'Blocked by earlier message %s. Later content is withheld; acknowledge the predecessor first.' % out['blocked_by']
-        else:
-            out['content_visible'] = out.get('text') is not None
+        out['content_visible'] = out.get('text') is not None
+        if out.get('to_key') == key:
+            blocker = self._row("SELECT msg_id,state FROM incoming2 WHERE from_key=? AND to_key=? AND seq<? AND state NOT IN ('injected','acknowledged') ORDER BY seq LIMIT 1", (out.get('from_key'), key, out.get('seq', 0)))
+            if blocker:
+                out['blocked_by_delivery'] = blocker['msg_id']
+                out['delivery_blocker_state'] = blocker['state']
+                out['presentation_warning'] = 'Native presentation is blocked by an unresolved earlier injection; the ordered inbox remains readable. No manual ACK is required for transport.'
         return out
 
+    @staticmethod
+    def _valid(message):
+        text = message.get('text')
+        return (isinstance(text, str) and message.get('text_bytes') == len(text.encode('utf-8'))
+                and message.get('sha256') == digest(text))
+
+    def _persist(self, message):
+        """Commit the entire immutable recovery envelope before any receipt."""
+        if not self._valid(message):
+            raise ValueError('Content integrity mismatch')
+        now = time.time()
+        with self.store._lock:
+            db = self.store._db
+            db.execute('BEGIN IMMEDIATE')
+            try:
+                old = db.execute('SELECT * FROM incoming2 WHERE msg_id=?', (message['msg_id'],)).fetchone()
+                if old and (old['from_key'] != message['from_key'] or old['to_key'] != message['to_key'] or old['seq'] != message['seq']):
+                    raise ValueError('Conflicting persisted envelope identity')
+                if old and old['envelope']:
+                    saved = json.loads(old['envelope'])
+                    if any(saved.get(k) != message.get(k) for k in ('text','sha256','text_bytes','reply_to')):
+                        raise ValueError('Conflicting persisted envelope content')
+                if old:
+                    db.execute('UPDATE incoming2 SET envelope=?,received_at=COALESCE(received_at,?),updated_at=? WHERE msg_id=?', (json.dumps(message, ensure_ascii=False),now,now,message['msg_id']))
+                else:
+                    db.execute("INSERT INTO incoming2(msg_id,from_key,to_key,seq,state,detail,attempt,updated_at,envelope,received_at) VALUES (?,?,?,?, 'received', NULL,?,?,?,?)", (message['msg_id'],message['from_key'],message['to_key'],message['seq'],message['attempt'],now,json.dumps(message,ensure_ascii=False),now))
+                db.execute('COMMIT')
+            except BaseException:
+                db.execute('ROLLBACK')
+                raise
+
+    def _confirm(self, row):
+        message = json.loads(row['envelope'])
+        try:
+            current = self.node.hub.status2(row['msg_id'], row['to_key'])
+            if not current.get('receiver_persisted'):
+                self.node.hub.receive2(dict(msg_id=row['msg_id'],session_key=row['to_key'],attempt=current['attempt'],sha256=message['sha256'],text_bytes=message['text_bytes']))
+            self.store._exec('UPDATE incoming2 SET receipt_sent=1,attempt=? WHERE msg_id=?', (current['attempt'],row['msg_id']))
+            return True
+        except HubError as e:
+            self.node._log('v2 durable receipt %s deferred: %s' % (row['msg_id'],e.code))
+            return False
+
+    def recover(self, force=False):
+        """Replay commits/receipts and backfill legacy metadata without re-injection."""
+        if not self.available() or (not force and time.monotonic() < self.recover_at):
+            return
+        self.recover_at = time.monotonic() + 5
+        with self.receive_lock:
+            for row in self._rows("SELECT * FROM incoming2 WHERE envelope IS NULL AND body_pruned=0 AND state!='acknowledged' ORDER BY updated_at LIMIT 64"):
+                try:
+                    message = self.node.hub.message2(row['msg_id'],row['to_key'])
+                    if message.get('text') is not None:
+                        self._persist(message)
+                    else:
+                        self.store._exec('UPDATE incoming2 SET updated_at=? WHERE msg_id=?',(time.time(),row['msg_id']))
+                except (HubError,ValueError):
+                    self.store._exec('UPDATE incoming2 SET updated_at=? WHERE msg_id=?',(time.time(),row['msg_id']))
+                    continue
+            for row in self._rows('SELECT * FROM incoming2 WHERE envelope IS NOT NULL AND receipt_sent=0 ORDER BY from_key,to_key,seq'):
+                self._confirm(row)
+            # Successful/uncertain pre-v0.3 outcomes are preserved. Re-reporting
+            # only sends their immutable outcome, never native text a second time.
+            for row in self._rows("SELECT * FROM incoming2 WHERE receipt_sent=1 AND report_sent=0 AND state IN ('injected','in_doubt','failed')"):
+                self._report(row['msg_id'],row['attempt'],row['state'],row['detail'])
+            self._drain()
+
+    def _drain(self):
+        for row in self._rows("SELECT * FROM incoming2 WHERE envelope IS NOT NULL AND receipt_sent=1 AND state='received' ORDER BY from_key,to_key,seq"):
+            blocker = self._row("SELECT msg_id FROM incoming2 WHERE from_key=? AND to_key=? AND seq<? AND state NOT IN ('injected','acknowledged') LIMIT 1",(row['from_key'],row['to_key'],row['seq']))
+            if blocker:
+                continue
+            if not self.store._exec("UPDATE incoming2 SET state='injecting',updated_at=? WHERE msg_id=? AND state='received'", (time.time(),row['msg_id'])):
+                continue
+            try:
+                outcome, detail = self.node._inject(json.loads(row['envelope']))
+                state = 'injected' if outcome == 'delivered' else ('in_doubt' if str(detail).startswith('in_doubt:') else 'failed')
+            except Exception:
+                state, detail = 'in_doubt', 'in_doubt: interrupted native injection; inspect ordered inbox'
+            self.store._exec("UPDATE incoming2 SET state=?,detail=?,updated_at=? WHERE msg_id=? AND state='injecting'", (state,detail,time.time(),row['msg_id']))
+            self._report(row['msg_id'],row['attempt'],state,detail)
+
     def handle(self, message):
+        with self.receive_lock:
+            self._handle(message)
+
+    def _handle(self, message):
         mid, attempt = message.get('msg_id'), message.get('attempt')
         if not mid or not isinstance(attempt, int):
             return
         previous = self._row('SELECT * FROM incoming2 WHERE msg_id=?', (mid,))
-        if previous:
-            if previous['state'] != 'acknowledged':
-                self._report(mid, attempt, 'in_doubt' if previous['state'] == 'injecting' else previous['state'], previous['detail'])
+        if previous and previous.get('envelope'):
+            if not previous['receipt_sent']:
+                self._confirm(previous)
+            self._drain()
             return
         # Ask the authoritative head immediately before exposing content; do not
         # consume a later message merely because a stale pull response arrived.
@@ -277,20 +384,25 @@ class Reliable:
             return
         if current.get('state') != 'leased' or current.get('blocked_by') or current.get('attempt') != attempt:
             return
-        text = message.get('text')
-        valid = (isinstance(text, str) and message.get('text_bytes') == len(text.encode('utf-8'))
-                 and message.get('sha256') == digest(text))
-        if not valid:
+        if not self._valid(message):
             self._report(mid, attempt, 'failed', 'Content integrity mismatch; no injection attempted')
             return
-        self.store._exec('INSERT OR IGNORE INTO incoming2(msg_id,from_key,to_key,seq,state,detail,attempt,updated_at) VALUES (?,?,?,?,?,?,?,?)', (mid, message['from_key'], message['to_key'], message['seq'], 'injecting', None, attempt, time.time()))
-        outcome, detail = self.node._inject(message)
-        state = 'injected' if outcome == 'delivered' else ('in_doubt' if str(detail).startswith('in_doubt:') else 'failed')
-        self.store._exec("UPDATE incoming2 SET state=?,detail=?,attempt=?,updated_at=? WHERE msg_id=? AND state='injecting'", (state, detail, attempt, time.time(), mid))
-        self._report(mid, attempt, state, detail)
+        self._persist(message)
+        row = self._row('SELECT * FROM incoming2 WHERE msg_id=?',(mid,))
+        if self._confirm(row):
+            self._drain()
 
     def _report(self, mid, attempt, state, detail):
         try:
             self.node.hub.report2({'msg_id': mid, 'attempt': attempt, 'state': state, 'detail': detail})
+            self.store._exec('UPDATE incoming2 SET report_sent=1 WHERE msg_id=?',(mid,))
         except HubError as e:
+            if e.code == 'report_conflict':
+                try:
+                    current = self.node.hub.status2(mid, self._row('SELECT to_key FROM incoming2 WHERE msg_id=?',(mid,))['to_key'])
+                    if current.get('state') == 'acknowledged':
+                        self.store._exec('UPDATE incoming2 SET report_sent=1 WHERE msg_id=?',(mid,))
+                        return
+                except (HubError,TypeError):
+                    pass
             self.node._log('v2 report %s deferred: %s' % (mid, e.code))
