@@ -30,6 +30,11 @@ def main(argv=None):
     if cmd == "node":
         from . import node
         return node.main(rest)
+    if cmd == "selftest":  # hot-swap check run by an older MCP before it switches to this version
+        from . import mcp_server
+        json.dumps([dict(name=n, **spec) for n, (_, spec) in mcp_server.TOOLS.items()])
+        print("ok")
+        return 0
     if cmd == "mcp":
         from . import mcp_server
         return mcp_server.main(rest)

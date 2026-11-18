@@ -19,7 +19,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agentbus import hub  # noqa: E402
+from agentbus import __version__, hub  # noqa: E402
 
 TOKEN = "test-token-0123456789"
 MAX_TEXT = 64 * 1024
@@ -117,7 +117,7 @@ class TestAuthAndHealth(HubTestCase):
     def test_health_needs_no_auth(self):
         status, out = self.get("/v1/health", token=None)
         self.assertEqual(status, 200)
-        self.assertEqual(out, {"ok": True, "version": "0.4.1", "protocols": [1, 2],
+        self.assertEqual(out, {"ok": True, "version": __version__, "protocols": [1, 2],
                                "capabilities": ["durable_receipts", "native_controls"]})
 
     def test_missing_or_wrong_token_is_401(self):

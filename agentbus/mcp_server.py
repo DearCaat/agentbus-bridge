@@ -29,6 +29,8 @@ import time
 import traceback
 import uuid
 
+from . import hotswap
+
 SERVER_NAME = "agentbus"
 SERVER_VERSION = "0.4.0"
 RUNTIME_ID = uuid.uuid4().hex
@@ -600,7 +602,7 @@ def handle_request(sess, method, params):
     if method == "initialize":
         return {
             "protocolVersion": params.get("protocolVersion") or DEFAULT_PROTOCOL_VERSION,
-            "capabilities": {"tools": {}, "experimental": {"agentbus": {
+            "capabilities": {"tools": {"listChanged": True}, "experimental": {"agentbus": {
                 "runtime_id": RUNTIME_ID, "reload_generation": RELOAD_GENERATION}}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
         }
@@ -661,14 +663,16 @@ def node_watchdog(sess, interval=60.0):
         except OSError:
             pass
         log("node not reachable; running node --ensure")
-        ensure_node()
-        with sess.lock:
-            sess.reg = None
-        try_register(sess)
+        with hotswap.SWAP_LOCK:  # no hot swap while restarting the node and re-registering
+            ensure_node()
+            with sess.lock:
+                sess.reg = None
+            try_register(sess)
 
 
 def main(argv=None):
-    """Entry point. argv is accepted for `python3 -m agentbus mcp` and ignored."""
+    """Entry point for `python3 -m agentbus mcp`. argv may carry hotswap.REEXEC_ARG (see hotswap.py)."""
+    reexec = hotswap.REEXEC_ARG in (argv or [])
     sess = Session()
     sess.detect()
     ensure_node()
@@ -677,10 +681,14 @@ def main(argv=None):
         if sess.harness == "codex":
             threading.Thread(target=codex_watch, args=(sess,), daemon=True).start()
     threading.Thread(target=node_watchdog, args=(sess,), daemon=True).start()
-    for raw in sys.stdin.buffer:
+    reader = hotswap.reader_from_env()
+    if reexec:  # just switched from an older version: ask the client to re-read the tool list
+        write_msg({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+    for raw in reader:
         line = raw.decode("utf-8", "replace").strip()
         if line:
             handle_line(sess, line)
+            hotswap.maybe_swap(reader, sess.harness)
 
 
 if __name__ == "__main__":
