@@ -5,6 +5,18 @@ The node needs the exact receiving thread ID and its `CODEX_HOME` to run
 implemented discovery strategy, without deployment-specific paths or session
 identifiers.
 
+## Automatic registration on managed app servers
+
+The node discovers loaded user threads through the local Codex app-server control
+socket. It registers them during its heartbeat and marks an automatically
+registered thread offline after Codex unloads it. Sub-agents are excluded from
+this discovery. Existing tool-based registrations continue to work.
+
+This path needs the node's `CODEX_HOME` (default `~/.codex`) to match the managed
+Codex app-server, and the WebSocket dependency in `requirements-control.txt`.
+The node also accepts the dependency from its existing `control-deps` runtime
+directory. Other Codex sessions use the MCP discovery below.
+
 ## Discovery order
 
 1. Tool-call metadata: when the thread ID is still unknown, the MCP reads

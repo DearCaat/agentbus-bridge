@@ -384,6 +384,9 @@ class Node:
         self.hub = None
         self.store = None
         self.codex_bin = "codex"
+        self.codex_home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+        self.codex_presence = (0, {})
+        self._registration_lock = threading.Lock()
         self.tunnels = []
         self._stop = threading.Event()
         self._running = False
@@ -630,7 +633,11 @@ class Node:
             return _fail("hub_unreachable", e.message)
         return _fail(e.code or "hub_error", e.message)
 
-    def _op_register(self, req, peer_pid):
+    def _op_register(self, req, peer_pid, *, automatic=False):
+        with self._registration_lock:
+            return self._register_session(req, peer_pid, automatic=automatic)
+
+    def _register_session(self, req, peer_pid, *, automatic):
         harness = req.get("harness")
         session_id = req.get("session_id")
         if harness not in HARNESSES:
@@ -649,6 +656,10 @@ class Node:
         if cwd:
             body["cwd"] = cwd
         mcp_pid = _int(req.get("mcp_pid")) or peer_pid
+        if automatic:
+            existing = self.store.get_session("%s:codex:%s" % (self.machine, session_id))
+            if existing and self._session_live(existing):
+                return {"ok": True, "session_key": existing["session_key"], "address": existing["address"]}
         try:
             r = self.hub.register(body)
         except HubError as e:
@@ -656,6 +667,9 @@ class Node:
 
         key = r["session_key"]
         address = r["address"]
+        local_delivery = _deliver_fields(harness, deliver)
+        if automatic:
+            local_delivery["presence"] = "codex_app_server"
         self.store.upsert_session(
             key,
             harness,
@@ -663,7 +677,7 @@ class Node:
             address,
             r.get("name") or name or session_id[:8],
             cwd,
-            _deliver_fields(harness, deliver),  # local only: the Claude token never goes to the hub
+            local_delivery,  # local only: the Claude token never goes to the hub
             mcp_pid,
             time.time(),
         )
@@ -720,7 +734,7 @@ class Node:
         except HubError:
             hub_ok = False
         sessions = [
-            {"session_key": s["session_key"], "address": s["address"], "live": pid_alive(s["mcp_pid"])}
+            {"session_key": s["session_key"], "address": s["address"], "live": self._session_live(s)}
             for s in self.store.list_sessions()
         ]
         return {
@@ -757,13 +771,49 @@ class Node:
             self._log("hub returned key %s for local %s" % (r.get("session_key"), sess["session_key"]))
         return r
 
+    def _session_live(self, session):
+        if session["deliver"].get("presence") == "codex_app_server":
+            pid, threads = self.codex_presence
+            return session["mcp_pid"] == pid and session["session_id"] in threads and pid_alive(pid)
+        return pid_alive(session["mcp_pid"])
+
+    def _refresh_codex_presence(self):
+        from .codex_presence import loaded_threads
+
+        endpoint = os.path.join(self.codex_home, "app-server-control", "app-server-control.sock")
+        if not os.path.exists(endpoint):
+            self.codex_presence = (0, {})
+            return
+        try:
+            pid, threads = loaded_threads(self.codex_home, os.path.join(self.p.home, "control-deps"))
+        except Exception as exc:
+            self.codex_presence = (0, {})
+            self._log("Codex loaded-thread discovery failed: %s" % type(exc).__name__)
+            return
+        self.codex_presence = (pid, threads)
+        for thread_id, cwd in threads.items():
+            key = "%s:codex:%s" % (self.machine, thread_id)
+            session = self.store.get_session(key)
+            if session is not None and self._session_live(session):
+                continue
+            response = self._op_register({
+                "harness": "codex",
+                "session_id": thread_id,
+                "name": session["name"] if session else None,
+                "cwd": cwd,
+                "deliver": {"thread_id": thread_id, "codex_home": self.codex_home},
+            }, pid, automatic=True)
+            if not response["ok"]:
+                self._log("Codex automatic registration %s failed: %s" % (thread_id, response["error"]))
+
     def heartbeat_once(self):
         """Re-register every live local session, then heartbeat the live list.
 
         Re-registering on every cycle is what restores sessions after a hub restart with a
         fresh DB; the hub treats register as idempotent.
         """
-        live_sessions = [s for s in self.store.list_sessions() if pid_alive(s["mcp_pid"])]
+        self._refresh_codex_presence()
+        live_sessions = [s for s in self.store.list_sessions() if self._session_live(s)]
         for s in live_sessions:
             try:
                 self._hub_register_session(s)
@@ -894,7 +944,7 @@ class Node:
             sess = self.store.get_session(to_key)
             if sess is None:
                 return "failed", "no local session for %s" % to_key
-            if not pid_alive(sess["mcp_pid"]):
+            if not self._session_live(sess):
                 return "failed", "target session not live (mcp_pid %s)" % sess["mcp_pid"]
             from_address = m.get("from_address") or ""
             local = same_machine_harness(from_address, self.machine, sess["harness"])
