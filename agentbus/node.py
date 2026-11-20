@@ -22,6 +22,7 @@ import uuid
 
 from .hubclient import HubClient, HubError
 from .inject import inject_claude, inject_codex, render, same_machine_harness
+from .session_metadata import session_metadata
 
 DEFAULT_HUB_URL = "http://127.0.0.1:37460"
 HARNESSES = ("claude", "codex")
@@ -371,7 +372,7 @@ class Store:
 
 
 def _deliver_fields(harness, deliver):
-    keys = ("socket", "token") if harness == "claude" else ("thread_id", "codex_home")
+    keys = ("socket", "token", "claude_config_dir") if harness == "claude" else ("thread_id", "codex_home")
     return {k: deliver[k] for k in keys if isinstance(deliver.get(k), str) and deliver.get(k)}
 
 
@@ -656,18 +657,19 @@ class Node:
         if cwd:
             body["cwd"] = cwd
         mcp_pid = _int(req.get("mcp_pid")) or peer_pid
+        local_delivery = _deliver_fields(harness, deliver)
         if automatic:
             existing = self.store.get_session("%s:codex:%s" % (self.machine, session_id))
             if existing and self._session_live(existing):
                 return {"ok": True, "session_key": existing["session_key"], "address": existing["address"]}
         try:
+            body.update(session_metadata(harness, session_id, cwd, local_delivery))
             r = self.hub.register(body)
         except HubError as e:
             return self._hub_fail(e)
 
         key = r["session_key"]
         address = r["address"]
-        local_delivery = _deliver_fields(harness, deliver)
         if automatic:
             local_delivery["presence"] = "codex_app_server"
         self.store.upsert_session(
@@ -718,7 +720,14 @@ class Node:
             r = self.hub.peers()
         except HubError as e:
             return self._hub_fail(e)
-        return {"ok": True, "peers": r.get("peers", [])}
+        result = {"ok": True, "peers": r.get("peers", [])}
+        key = req.get("session_key")
+        session = self.store.get_session(key) if isinstance(key, str) else None
+        if session and session["mcp_pid"] == peer_pid:
+            result["self_metadata"] = session_metadata(
+                session["harness"], session["session_id"], session["cwd"], session["deliver"],
+            )
+        return result
 
     def _op_status(self, req, peer_pid):
         if req.get("msg_id"):
@@ -766,6 +775,7 @@ class Node:
             body["name"] = sess["name"]
         if sess.get("cwd"):
             body["cwd"] = sess["cwd"]
+        body.update(session_metadata(sess["harness"], sess["session_id"], sess["cwd"], sess["deliver"]))
         r = self.hub.register(body)
         if r.get("session_key") != sess["session_key"]:
             self._log("hub returned key %s for local %s" % (r.get("session_key"), sess["session_key"]))

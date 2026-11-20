@@ -181,6 +181,8 @@ class Session:
                 "socket": os.environ.get("CLAUDE_CODE_MESSAGING_SOCKET"),
                 "token": os.environ.get("CLAUDE_CODE_MESSAGING_TOKEN"),
             }
+            if os.environ.get("CLAUDE_CONFIG_DIR"):
+                self.deliver["claude_config_dir"] = os.environ["CLAUDE_CONFIG_DIR"]
         else:
             self.harness = "codex"
 
@@ -292,18 +294,22 @@ def target_machine_harness(to):
 
 
 def tool_whoami(sess, args):
+    reg = sess.reg or {}
+    metadata = {}
     try:
-        node_call({"op": "peers"})
+        response = node_call({"op": "peers", "session_key": reg.get("session_key")})
+        metadata = response.get("self_metadata") or {}
         node_status = "ok"
     except NodeError as e:
         node_status = str(e)
-    reg = sess.reg or {}
     return {
         "harness": sess.harness,
         "session_id": sess.session_id,
         "registered": sess.reg is not None,
         "address": reg.get("address"),
         "session_key": reg.get("session_key"),
+        "model_name": metadata.get("model_name"),
+        "effort": metadata.get("effort"),
         "mcp_pid": os.getpid(),
         "node": node_status,
         "last_error": None if sess.reg is not None else sess.last_error,
@@ -315,11 +321,12 @@ def tool_peers(sess, args):
     peers = resp.get("peers") or []
     if not peers:
         return "no peers"
-    rows = [("address", "online", "cwd", "last_seen")]
+    rows = [("address", "online", "cwd", "last_seen", "model_name", "effort")]
     for p in peers:
         rows.append((str(p.get("address", "")), "yes" if p.get("online") else "no",
-                     str(p.get("cwd", "")), str(p.get("last_seen", ""))))
-    widths = [max(len(r[i]) for r in rows) for i in range(4)]
+                     str(p.get("cwd", "")), str(p.get("last_seen", "")),
+                     str(p.get("model_name") or "unknown"), str(p.get("effort") or "unknown")))
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
     return "\n".join("  ".join(c.ljust(widths[i]) for i, c in enumerate(r)).rstrip() for r in rows)
 
 
@@ -479,10 +486,10 @@ TOOLS = {
         'inputSchema':{'type':'object','properties':{'control_id':{'type':'string'},'request_id':{'type':'string'}},
             'oneOf':[{'required':['control_id']},{'required':['request_id']}],'additionalProperties':False}}),
     "agentbus_whoami": (tool_whoami, {
-        "description": "Show this session's agentbus address, session key, and node status.",
+        "description": "Show this session's agentbus address, session key, observed model_name and effort, and node status.",
         "inputSchema": SCHEMA_EMPTY}),
     "agentbus_peers": (tool_peers, {
-        "description": "List agentbus peers (address, online, cwd, last_seen). agentbus is only for peers on "
+        "description": "List agentbus peers (address, online, cwd, last_seen, observed model_name and effort). agentbus is only for peers on "
                        "another machine or with another harness: a peer on this machine with the same harness "
                        "is reached through the harness's own messaging (Claude Code: ListAgents, SendMessage).",
         "inputSchema": SCHEMA_EMPTY}),

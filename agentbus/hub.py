@@ -22,6 +22,7 @@ from logging.handlers import RotatingFileHandler
 from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
+from .session_metadata import EFFORT, MODEL_NAME
 
 VERSION = __version__
 DEFAULT_PORT = 37460
@@ -122,6 +123,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     name        TEXT NOT NULL,
     address     TEXT NOT NULL UNIQUE,
     cwd         TEXT,
+    model_name  TEXT,
+    effort      TEXT,
     online      INTEGER NOT NULL DEFAULT 0,
     last_seen   REAL,
     UNIQUE (machine, harness, name)
@@ -320,6 +323,14 @@ class Hub(object):
         self.conn.executescript(SCHEMA_V2)
         self.conn.executescript(CONTROL_SCHEMA)
         self._write(self._migrate_receipts_op)
+        self._write(self._migrate_session_metadata)
+
+    def _migrate_session_metadata(self):
+        columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(sessions)")}
+        if "model_name" not in columns:
+            self.conn.execute("ALTER TABLE sessions ADD COLUMN model_name TEXT")
+        if "effort" not in columns:
+            self.conn.execute("ALTER TABLE sessions ADD COLUMN effort TEXT")
 
     def _migrate_receipts_op(self):
         columns = {row["name"] for row in self.conn.execute("PRAGMA table_info(messages_v2)")}
@@ -379,10 +390,12 @@ class Hub(object):
         cwd = body.get("cwd")
         if cwd is not None and (not isinstance(cwd, str) or len(cwd) > 4096):
             raise _bad("cwd must be a string (max 4096 chars)")
-        return self._write(self._register_op, (machine, harness, session_id, name, cwd),
+        model = _opt_str(body, "model_name", MODEL_NAME, 128)
+        effort = _opt_str(body, "effort", EFFORT, 32)
+        return self._write(self._register_op, (machine, harness, session_id, name, cwd, model, effort),
                            notify=True)
 
-    def _register_op(self, machine, harness, session_id, name, cwd):
+    def _register_op(self, machine, harness, session_id, name, cwd, model, effort):
         key = "%s:%s:%s" % (machine, harness, session_id)
         now = time.time()
         row = self.conn.execute("SELECT name FROM sessions WHERE session_key=?",
@@ -403,13 +416,16 @@ class Hub(object):
         if row is None:
             self.conn.execute(
                 "INSERT INTO sessions (session_key, machine, harness, session_id, name, address, "
-                "cwd, online, last_seen) VALUES (?,?,?,?,?,?,?,1,?)",
-                (key, machine, harness, session_id, use_name, address, cwd, now))
+                "cwd, model_name, effort, online, last_seen) VALUES (?,?,?,?,?,?,?,?,?,1,?)",
+                (key, machine, harness, session_id, use_name, address, cwd, model, effort, now))
         else:
             self.conn.execute(
                 "UPDATE sessions SET name=?, address=?, cwd=COALESCE(?, cwd), online=1, "
                 "last_seen=? WHERE session_key=?",
                 (use_name, address, cwd, now, key))
+            if model is not None:
+                self.conn.execute("UPDATE sessions SET model_name=?, effort=? WHERE session_key=?",
+                                  (model, effort, key))
         return {"session_key": key, "address": address}
 
     def heartbeat(self, body):
@@ -446,6 +462,8 @@ class Hub(object):
                 "harness": r["harness"],
                 "name": r["name"],
                 "cwd": r["cwd"],
+                "model_name": r["model_name"],
+                "effort": r["effort"],
                 "online": bool(r["online"]),
                 "last_seen": _iso(r["last_seen"]),
             })

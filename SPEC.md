@@ -34,9 +34,9 @@ Bind 127.0.0.1:37460 (configurable). DB: SQLite file (WAL). Token: read from a f
 
 | Method/path | Body / query | Response |
 |---|---|---|
-| POST /v1/register | {machine, harness, session_id, name?, cwd?} | {session_key, address} ; 409 `name_taken` |
+| POST /v1/register | {machine, harness, session_id, name?, cwd?, model_name?, effort?} | {session_key, address} ; 409 `name_taken` |
 | POST /v1/heartbeat | {machine, live: [session_key...]} | {ok:true} ; sessions of that machine not in `live` become offline; listed ones online, last_seen=now |
-| GET /v1/peers | - | {peers:[{address, session_key, machine, harness, name, cwd, online, last_seen}]} |
+| GET /v1/peers | - | {peers:[{address, session_key, machine, harness, name, cwd, online, last_seen, model_name, effort}]} |
 | POST /v1/send | {from_key, to, text, client_msg_id} | {msg_id, target: address, target_online} ; 404 `unknown_target`; same (from_key, client_msg_id) returns the original msg_id (idempotent) |
 | GET /v1/pull | ?machine=M&wait=S (S<=25) | long-poll; {messages:[{msg_id, from_address, to_key, text, created_at}]} ; returned msgs move queued->leased (lease 120s; expired leases return to queued) |
 | POST /v1/report | {msg_id, state, detail?} | state ∈ delivered, failed, held, in_doubt ; terminal states are final |

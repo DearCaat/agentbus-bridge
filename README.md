@@ -24,6 +24,15 @@ needs no hosted service or GPU. Optional Codex native controls use
 `websocket-client`; see [control setup](docs/native-controls.md#optional-dependency).
 Protocol details: [SPEC.md](SPEC.md).
 
+## Session model and effort
+
+`agentbus_whoami` and `agentbus_peers` report `model_name` and `effort` when
+available. The node reads the exact Codex thread's local state or the latest
+recorded assistant model and effort in the Claude Code session transcript.
+Values may be unknown before the first turn or on harness versions that omit
+these fields. Across machines, the node updates the hub on registration and
+heartbeat. Use hub and nodes at v0.4.5 or later for remote metadata.
+
 ## Automatic durable receipts (v0.3.0)
 
 Upgrade the hub to v0.3.0 **before** enabling these clients. Verify that
