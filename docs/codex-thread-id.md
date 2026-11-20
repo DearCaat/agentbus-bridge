@@ -19,9 +19,10 @@ directory. Other Codex sessions use the MCP discovery below.
 
 ## Discovery order
 
-1. Tool-call metadata: when the thread ID is still unknown, the MCP reads
-   `params._meta.threadId`, falling back to
-   `params._meta["x-codex-turn-metadata"].thread_id` when present.
+1. Tool-call metadata: until the thread ID is confirmed by a tool call, the MCP
+   reads `params._meta.threadId`, falling back to
+   `params._meta["x-codex-turn-metadata"].thread_id` when present. This ID
+   supersedes any earlier registration inferred from an open rollout.
 2. Linux process file descriptors: before the first tool call, the MCP checks
    `/proc/<parent-pid>/fd/` for open files whose names match
    `rollout-<timestamp>-<thread-uuid>.jsonl`. It registers only when exactly one
@@ -31,8 +32,7 @@ directory. Other Codex sessions use the MCP discovery below.
 Neither source may exist at MCP initialization. A background watcher retries;
 registration can therefore be deferred until the first turn or tool call. This
 adapter does not choose a session based on its working directory or recency.
-Once a thread ID is known, later tool calls reuse it rather than performing
-metadata discovery again.
+Once tool-call metadata confirms a thread ID, later calls reuse it.
 
 ## Receiving environment
 

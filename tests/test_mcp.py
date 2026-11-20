@@ -22,7 +22,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from agentbus import mcp_server  # noqa: E402
+from agentbus import __version__, mcp_server  # noqa: E402
 
 CLAUDE_SID = "11111111-2222-3333-4444-555555555555"
 CODEX_TID = "22222222-3333-4444-8555-666666666666"
@@ -208,7 +208,7 @@ class TestProtocol(McpTestBase):
                                     "clientInfo": {"name": "t", "version": "0"}})
         res = msg["result"]
         self.assertEqual(res["protocolVersion"], "2025-06-18")
-        self.assertEqual(res["serverInfo"], {"name": "agentbus", "version": "0.4.0"})
+        self.assertEqual(res["serverInfo"], {"name": "agentbus", "version": __version__})
         self.assertIn("tools", res["capabilities"])
         metadata=res['capabilities']['experimental']['agentbus']
         self.assertTrue(metadata['runtime_id'])
@@ -387,6 +387,26 @@ class TestCodexFlow(McpTestBase):
         m = self.start_mcp(extra_env=self.codex_env())
         m.tool("agentbus_whoami", meta={"x-codex-turn-metadata": {"thread_id": CODEX_TID}})
         self.assertEqual(self.node.ops("register")[0]["session_id"], CODEX_TID)
+
+    def test_send_uses_metadata_over_existing_rollout_registration(self):
+        self.start_node()
+        rollout = os.path.join(self.home, "rollout-test-%s.jsonl" % CLAUDE_SID)
+        with open(rollout, "w"):
+            m = self.start_mcp(extra_env=self.codex_env())
+            err, text = m.tool("agentbus_whoami")
+            self.assertFalse(err)
+            self.assertEqual(json.loads(text)["session_id"], CLAUDE_SID)
+
+            err, _ = m.tool("agentbus_send", {
+                "request_id": "reply-1", "to": "testbox/claude/bob",
+                "text": "reply", "reply_to": "msg-parent",
+            }, meta={"x-codex-turn-metadata": {"thread_id": CODEX_TID}})
+
+        self.assertFalse(err)
+        self.assertEqual(self.node.ops("register")[-1]["session_id"], CODEX_TID)
+        send = self.node.ops("send2")[0]
+        self.assertEqual(send["session_key"], "testbox:codex:" + CODEX_TID)
+        self.assertEqual(send["reply_to"], "msg-parent")
 
     def test_send_before_any_thread_id_reports_not_registered(self):
         self.start_node()

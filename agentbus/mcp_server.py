@@ -29,10 +29,10 @@ import time
 import traceback
 import uuid
 
-from . import hotswap
+from . import __version__, hotswap
 
 SERVER_NAME = "agentbus"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = __version__
 RUNTIME_ID = uuid.uuid4().hex
 RELOAD_GENERATION = os.environ.get('AGENTBUS_RELOAD_GENERATION')
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
@@ -563,7 +563,8 @@ def handle_tools_call(sess, params):
     if name not in TOOLS:
         return tool_result("unknown tool: %s" % name, True)
 
-    if sess.harness == "codex" and sess.session_id is None:
+    # A rollout-derived registration can predate the first authoritative tool call.
+    if sess.harness == "codex" and not getattr(sess, "id_from_meta", False):
         meta = params.get("_meta") if isinstance(params.get("_meta"), dict) else {}
         tid = meta.get("threadId")
         if not (isinstance(tid, str) and UUID_RE.match(tid)):
@@ -573,7 +574,7 @@ def handle_tools_call(sess, params):
                 tid = ts["thread_id"]
         if tid:
             sess.adopt_codex_thread(tid, "tools/call _meta")
-        else:
+        elif sess.session_id is None:
             found = codex_thread_from_proc(sess.ppid)
             if found:
                 sess.adopt_codex_thread(found, "parent rollout fd")
