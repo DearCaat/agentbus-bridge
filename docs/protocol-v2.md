@@ -37,6 +37,8 @@ Native input is a separate ordered step. The node records `injecting` before
 writing; success becomes `injected`. An ambiguous socket/CLI result or interrupted
 write becomes `in_doubt`, and is never blindly reinjected. Failed/uncertain native
 presentation can block later native input, identified by `blocked_by_delivery`.
+A hub-accepted reply from the recipient to the original sender clears that
+message as a blocker while retaining the original native injection outcome.
 It does **not** hide retained inbox/message text or stop later durable transport
 receipts. Full local envelopes support restart recovery.
 

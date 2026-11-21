@@ -217,6 +217,34 @@ class ReliabilityTests(unittest.TestCase):
         self.assertEqual(item['text'],'next')
         self.assertEqual(item['blocked_by_delivery'],first['msg_id'])
 
+    def test_confirmed_reply_releases_later_native_input(self):
+        first = self.send()
+        second = self.send('later', 'next')
+        receiver = self.receiver.reliable()
+        self.receiver._inject = lambda m: ('failed', 'in_doubt: synthetic uncertain result')
+        receiver.handle(self.hub.pull2('target', 0)[0])
+        self.receiver._inject = self.inject
+        receiver.handle(self.hub.pull2('target', 0)[0])
+        self.assertEqual(self.observed, [])
+
+        reply = dict(client_msg_id='reply', to=self.a['address'],
+                     text='processed', reply_to=first['msg_id'])
+        self.receiver.hub.lose_send = True
+        self.assertEqual(self.incoming('send2', **reply)['submission'], 'unconfirmed')
+        receiver.recover(force=True)
+        self.assertEqual(self.observed, [])
+        self.assertEqual(self.incoming('message2', msg_id=second['msg_id'])['blocked_by_delivery'],
+                         first['msg_id'])
+
+        self.assertEqual(self.incoming('send2', **reply)['submission'], 'accepted')
+        self.assertNotIn('blocked_by_delivery', self.incoming('message2', msg_id=second['msg_id']))
+        receiver.recover(force=True)
+        receiver.recover(force=True)
+        self.assertEqual(self.observed, [second['msg_id']])
+        original = self.incoming('status2', msg_id=first['msg_id'])
+        self.assertEqual(original['injection_state'], 'in_doubt')
+        self.assertFalse(original['receiver_acknowledged'])
+
     def test_transient_recovery_storage_failure_does_not_kill_pull_loop(self):
         r=self.receiver.reliable()
         called=[]

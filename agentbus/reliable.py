@@ -269,11 +269,28 @@ class Reliable:
         result = self.node.hub.ack2({'msg_id': req['msg_id'], 'session_key': key})
         return dict(result, ok=True)
 
+    def _delivery_blocker(self, from_key, to_key, seq):
+        return self._row("""
+            SELECT earlier.msg_id, earlier.state
+            FROM incoming2 AS earlier
+            WHERE earlier.from_key=? AND earlier.to_key=? AND earlier.seq<?
+              AND earlier.state NOT IN ('injected','acknowledged')
+              AND NOT (
+                  earlier.state IN ('failed','in_doubt')
+                  AND EXISTS (
+                      SELECT 1 FROM outbox2 AS reply
+                      WHERE reply.from_key=earlier.to_key AND reply.to_key=earlier.from_key
+                        AND reply.reply_to=earlier.msg_id AND reply.state='accepted'
+                  )
+              )
+            ORDER BY earlier.seq LIMIT 1
+        """, (from_key, to_key, seq))
+
     def visible(self, message, key):
         out = dict(message)
         out['content_visible'] = out.get('text') is not None
         if out.get('to_key') == key:
-            blocker = self._row("SELECT msg_id,state FROM incoming2 WHERE from_key=? AND to_key=? AND seq<? AND state NOT IN ('injected','acknowledged') ORDER BY seq LIMIT 1", (out.get('from_key'), key, out.get('seq', 0)))
+            blocker = self._delivery_blocker(out.get('from_key'), key, out.get('seq', 0))
             if blocker:
                 out['blocked_by_delivery'] = blocker['msg_id']
                 out['delivery_blocker_state'] = blocker['state']
@@ -349,7 +366,7 @@ class Reliable:
 
     def _drain(self):
         for row in self._rows("SELECT * FROM incoming2 WHERE envelope IS NOT NULL AND receipt_sent=1 AND state='received' ORDER BY from_key,to_key,seq"):
-            blocker = self._row("SELECT msg_id FROM incoming2 WHERE from_key=? AND to_key=? AND seq<? AND state NOT IN ('injected','acknowledged') LIMIT 1",(row['from_key'],row['to_key'],row['seq']))
+            blocker = self._delivery_blocker(row['from_key'], row['to_key'], row['seq'])
             if blocker:
                 continue
             if not self.store._exec("UPDATE incoming2 SET state='injecting',updated_at=? WHERE msg_id=? AND state='received'", (time.time(),row['msg_id'])):
